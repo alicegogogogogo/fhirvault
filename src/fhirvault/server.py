@@ -61,11 +61,19 @@ def make_handler(service: FhirVault) -> type[BaseHTTPRequestHandler]:
             parts = [unquote(part) for part in split.path.split("/") if part]
             return parts, parse_qs(split.query, keep_blank_values=True)
 
+        def _transaction_body(self) -> Any:
+            try:
+                return self._body()
+            except ValidationError as error:
+                raise OperationOutcomeError(400, "invalid", str(error)) from error
+
         def _dispatch(self) -> Response:
             parts, query = self._segments()
             key = self.headers.get("Idempotency-Key")
             if self.command == "GET" and parts == ["health"]:
                 return 200, {"status": "ok"}, {}
+            if self.command == "POST" and parts == ["fhir"]:
+                return 200, service.transaction(self._transaction_body(), key), {}
             if parts and parts[0] == "fhir":
                 return self._resource_routes(parts[1:], query, key)
             if parts[:1] == ["Subscription"]:

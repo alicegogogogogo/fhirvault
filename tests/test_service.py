@@ -850,5 +850,298 @@ class ConditionalUpdateHttpTests(unittest.TestCase):
         self.assertEqual([1, 2], [entry["version"] for entry in history["entries"]])
 
 
+class TransactionTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = FhirVault(str(Path(self.directory.name) / "vault.db"), FrozenClock())
+        self.service.create("Patient", patient(), "k-patient")
+        self.service.create("Observation", observation(), "k-obs")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    @staticmethod
+    def entry(method: str, url: str, resource: dict | None = None, **request_extra) -> dict:
+        request = {"method": method, "url": url}
+        request.update(request_extra)
+        item = {"request": request}
+        if resource is not None:
+            item["resource"] = resource
+        return item
+
+    def transaction(self, entries: list[dict], key: str = "tx-1", **bundle_extra) -> dict:
+        bundle = {"resourceType": "Bundle", "type": "transaction", "entry": entries}
+        bundle.update(bundle_extra)
+        return self.service.transaction(bundle, key)
+
+    # ---------------------------------------------------------------- success
+
+    def test_mixed_transaction_applies_in_order(self):
+        result = self.transaction(
+            [
+                self.entry("POST", "Patient", patient("p-2")),
+                self.entry("POST", "Observation", observation("o-2", subject="Patient/p-2")),
+                self.entry("PUT", "Patient/p-1", patient(gender="female")),
+                self.entry("DELETE", "Observation/o-1"),
+            ]
+        )
+        self.assertEqual("Bundle", result["resourceType"])
+        self.assertEqual("transaction-response", result["type"])
+        self.assertEqual(4, len(result["entry"]))
+        statuses = [item["response"]["status"] for item in result["entry"]]
+        self.assertEqual(["201", "201", "200", "200"], statuses)
+        self.assertEqual("/fhir/Patient/p-2", result["entry"][0]["response"]["location"])
+        self.assertEqual('W/"1"', result["entry"][0]["response"]["etag"])
+        self.assertEqual("1", result["entry"][0]["resource"]["meta"]["versionId"])
+        self.assertEqual("2", result["entry"][2]["resource"]["meta"]["versionId"])
+        self.assertIsNone(result["entry"][3]["resource"])
+        self.assertNotIn("etag", result["entry"][3]["response"])
+        # Later entries see earlier writes.
+        self.assertEqual("Patient/p-2", self.service.read("Observation", "o-2")["subject"]["reference"])
+        with self.assertRaises(NotFoundError):
+            self.service.read("Observation", "o-1")
+
+    def test_reference_by_identifier_to_an_earlier_entry(self):
+        result = self.transaction(
+            [
+                self.entry("POST", "Patient", patient("p-9", identifier=[{"system": "mrn", "value": "Z9"}])),
+                self.entry("POST", "Encounter", encounter("e-9", subject="Patient/identifier|mrn|Z9")),
+            ]
+        )
+        self.assertEqual("201", result["entry"][1]["response"]["status"])
+        self.assertEqual("Patient/identifier|mrn|Z9", self.service.read("Encounter", "e-9")["subject"]["reference"])
+
+    def test_put_upserts_and_resurrects_deleted_ids(self):
+        self.service.delete("Observation", "o-1", "k-del")
+        result = self.transaction(
+            [
+                self.entry("PUT", "Observation/o-1", observation(value=1.0)),
+                self.entry("PUT", "Encounter/e-new", encounter("e-new")),
+            ]
+        )
+        self.assertEqual("3", result["entry"][0]["resource"]["meta"]["versionId"])
+        self.assertEqual("1", result["entry"][1]["resource"]["meta"]["versionId"])
+
+    def test_put_if_match_inside_transaction(self):
+        result = self.transaction(
+            [self.entry("PUT", "Observation/o-1", observation(value=8.0), **{"ifMatch": 'W/"1"'})]
+        )
+        self.assertEqual("2", result["entry"][0]["resource"]["meta"]["versionId"])
+        with self.assertRaises(OperationOutcomeError) as caught:
+            self.transaction(
+                [self.entry("PUT", "Observation/o-1", observation(value=9.0), **{"ifMatch": '"1"'})], "tx-2"
+            )
+        self.assertEqual(412, caught.exception.status)
+        self.assertEqual("conflict", caught.exception.issue_code)
+        with self.assertRaises(OperationOutcomeError) as caught:
+            self.transaction(
+                [self.entry("PUT", "Observation/o-404", observation("o-404"), **{"ifMatch": "*"})], "tx-3"
+            )
+        self.assertEqual(404, caught.exception.status)
+        self.assertEqual("not-found", caught.exception.issue_code)
+        with self.assertRaises(OperationOutcomeError) as caught:
+            self.transaction(
+                [self.entry("PUT", "Observation/o-1", observation(value=9.0), **{"ifMatch": "bogus"})], "tx-4"
+            )
+        self.assertEqual(400, caught.exception.status)
+        self.assertEqual("invalid", caught.exception.issue_code)
+        self.assertEqual("2", self.service.read("Observation", "o-1")["meta"]["versionId"])
+
+    def test_events_are_recorded_in_order_without_duplicates(self):
+        self.service.create_subscription({"id": "sub-tx", "criteria": {"type": "Patient"}}, "s-tx")
+        self.transaction(
+            [
+                self.entry("POST", "Patient", patient("p-2")),
+                self.entry("PUT", "Patient/p-1", patient(gender="female")),
+                self.entry("DELETE", "Patient/p-2"),
+            ]
+        )
+        events = self.service.events("sub-tx")["events"]
+        self.assertEqual(["created", "updated", "deleted"], [event["event"] for event in events])
+        self.assertEqual(["Patient/p-2", "Patient/p-1", "Patient/p-2"], [event["resource"] for event in events])
+        self.assertEqual([1, 2, 3], [event["sequence"] for event in events])
+
+    # ---------------------------------------------------------------- rollback
+
+    def test_first_failure_rolls_back_the_whole_batch(self):
+        with self.assertRaises(OperationOutcomeError) as caught:
+            self.transaction(
+                [
+                    self.entry("POST", "Patient", patient("p-2")),
+                    self.entry("POST", "Observation", observation("o-2", subject="Patient/p-404")),
+                    self.entry("DELETE", "Observation/o-1"),
+                ]
+            )
+        self.assertEqual(400, caught.exception.status)
+        self.assertEqual("invalid", caught.exception.issue_code)
+        with self.assertRaises(NotFoundError):
+            self.service.read("Patient", "p-2")
+        self.assertEqual("1", self.service.read("Observation", "o-1")["meta"]["versionId"])
+
+    def test_only_the_first_error_is_reported(self):
+        with self.assertRaises(OperationOutcomeError) as caught:
+            self.transaction(
+                [
+                    self.entry("POST", "Patient", patient()),  # duplicate: 409
+                    self.entry("DELETE", "Observation/o-404"),  # would be 404
+                ]
+            )
+        self.assertEqual(409, caught.exception.status)
+        self.assertEqual("conflict", caught.exception.issue_code)
+
+    def test_post_with_an_existing_id_conflicts(self):
+        with self.assertRaises(OperationOutcomeError) as caught:
+            self.transaction([self.entry("POST", "Patient", patient())])
+        self.assertEqual(409, caught.exception.status)
+        self.assertEqual("conflict", caught.exception.issue_code)
+
+    def test_delete_of_missing_or_deleted_resource_is_not_found(self):
+        for key, target in (("tx-a", "Observation/o-404"), ("tx-b", "Observation/o-1")):
+            if target.endswith("o-1"):
+                self.service.delete("Observation", "o-1", "k-del-2")
+            with self.assertRaises(OperationOutcomeError) as caught:
+                self.transaction([self.entry("DELETE", target)], key)
+            self.assertEqual(404, caught.exception.status)
+            self.assertEqual("not-found", caught.exception.issue_code)
+
+    # ---------------------------------------------------------------- envelope validation
+
+    def test_envelope_validation_errors_are_invalid(self):
+        cases = [
+            ({"type": "transaction", "entry": [self.entry("DELETE", "Observation/o-1")]}, "resourceType must be Bundle"),
+            ({"resourceType": "Bundle", "type": "batch", "entry": [self.entry("DELETE", "Observation/o-1")]}, "type must be transaction"),
+            ({"resourceType": "Bundle", "type": "transaction", "entry": []}, "1 to 100"),
+            ({"resourceType": "Bundle", "type": "transaction", "entry": [self.entry("DELETE", "Observation/o-1")] * 101}, "1 to 100"),
+            ({"resourceType": "Bundle", "type": "transaction", "entry": [self.entry("DELETE", "Observation/o-1")], "id": "b1"}, "unknown fields: id"),
+            ({"resourceType": "Bundle", "type": "transaction", "entry": [{"request": {"method": "GET", "url": "Patient/p-1"}}]}, "method must be one of"),
+            ({"resourceType": "Bundle", "type": "transaction", "entry": [{"request": {"method": "POST", "url": "Device"}, "resource": {"resourceType": "Device", "id": "d-1"}}]}, "not supported"),
+            ({"resourceType": "Bundle", "type": "transaction", "entry": [{"request": {"method": "POST", "url": "Patient"}, "resource": patient(), "fullUrl": "x"}]}, "unknown fields: fullUrl"),
+            ({"resourceType": "Bundle", "type": "transaction", "entry": [{"request": {"method": "POST", "url": "Patient", "ifMatch": "*"}, "resource": patient()}]}, "unknown fields: ifMatch"),
+            ({"resourceType": "Bundle", "type": "transaction", "entry": [{"request": {"method": "POST", "url": "Patient"}}]}, "resource is required"),
+            ({"resourceType": "Bundle", "type": "transaction", "entry": [{"request": {"method": "DELETE", "url": "Observation/o-1"}, "resource": {}}]}, "must not contain a resource"),
+            ({"resourceType": "Bundle", "type": "transaction", "entry": [{"request": {"method": "POST", "url": "Patient"}, "resource": observation("o-9")}]}, "resourceType must be Patient"),
+            ({"resourceType": "Bundle", "type": "transaction", "entry": [self.entry("PUT", "Patient/p-1", patient("p-2"))]}, "id must match"),
+            ({"resourceType": "Bundle", "type": "transaction", "entry": [self.entry("PUT", "Patient", patient())]}, "resourceType>/<id"),
+        ]
+        for index, (bundle, fragment) in enumerate(cases):
+            with self.subTest(fragment=fragment):
+                with self.assertRaisesRegex(OperationOutcomeError, fragment) as caught:
+                    self.service.transaction(bundle, f"tx-env-{index}")
+                self.assertEqual(400, caught.exception.status)
+                self.assertEqual("invalid", caught.exception.issue_code)
+        self.assertEqual("1", self.service.read("Observation", "o-1")["meta"]["versionId"])
+
+    def test_missing_idempotency_key_is_invalid(self):
+        with self.assertRaises(OperationOutcomeError) as caught:
+            self.service.transaction(
+                {"resourceType": "Bundle", "type": "transaction", "entry": [self.entry("DELETE", "Observation/o-1")]}, None
+            )
+        self.assertEqual(400, caught.exception.status)
+        self.assertEqual("invalid", caught.exception.issue_code)
+        self.assertEqual("1", self.service.read("Observation", "o-1")["meta"]["versionId"])
+
+    # ---------------------------------------------------------------- idempotency
+
+    def test_replay_returns_the_first_response_without_new_versions_or_events(self):
+        self.service.create_subscription({"id": "sub-replay", "criteria": {"type": "Patient"}}, "s-replay")
+        entries = [self.entry("POST", "Patient", patient("p-2")), self.entry("PUT", "Patient/p-1", patient(gender="female"))]
+        first = self.transaction(entries, "tx-replay")
+        replayed = self.transaction(entries, "tx-replay")
+        self.assertEqual(first, replayed)
+        self.assertEqual("2", self.service.read("Patient", "p-1")["meta"]["versionId"])
+        self.assertEqual(2, self.service.events("sub-replay")["total"])
+
+    def test_key_reuse_with_a_different_transaction_conflicts(self):
+        self.transaction([self.entry("POST", "Patient", patient("p-2"))], "tx-shared")
+        with self.assertRaises(OperationOutcomeError) as caught:
+            self.transaction([self.entry("POST", "Patient", patient("p-3"))], "tx-shared")
+        self.assertEqual(409, caught.exception.status)
+        self.assertEqual("conflict", caught.exception.issue_code)
+        with self.assertRaises(NotFoundError):
+            self.service.read("Patient", "p-3")
+
+    # ---------------------------------------------------------------- http surface
+
+    def test_http_transaction_end_to_end(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.service))
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            bundle = {
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [
+                    self.entry("POST", "Patient", patient("p-20")),
+                    self.entry("POST", "Observation", observation("o-20", subject="Patient/p-20")),
+                ],
+            }
+            status, headers, body = http_request(port, "POST", "/fhir", bundle, {"Idempotency-Key": "h-tx"})
+            self.assertEqual(200, status)
+            self.assertEqual("transaction-response", body["type"])
+            self.assertEqual(["201", "201"], [item["response"]["status"] for item in body["entry"]])
+
+            # Replay over HTTP returns the first response.
+            status, _, replayed = http_request(port, "POST", "/fhir", bundle, {"Idempotency-Key": "h-tx"})
+            self.assertEqual(200, status)
+            self.assertEqual(body, replayed)
+
+            # A failing batch reports an OperationOutcome and changes nothing.
+            failing = {
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [
+                    self.entry("POST", "Patient", patient("p-21")),
+                    self.entry("DELETE", "Observation/o-404"),
+                ],
+            }
+            status, headers, body = http_request(port, "POST", "/fhir", failing, {"Idempotency-Key": "h-tx-2"})
+            self.assertEqual(404, status)
+            self.assertEqual("application/fhir+json", headers.get("content-type"))
+            self.assertEqual("OperationOutcome", body["resourceType"])
+            self.assertEqual("not-found", body["issue"][0]["code"])
+            self.assertEqual(404, http_request(port, "GET", "/fhir/Patient/p-21")[0])
+
+            # Envelope and framing errors are 400 invalid OperationOutcomes.
+            for payload, headers_in in (
+                ({"resourceType": "Bundle", "type": "transaction", "entry": []}, {"Idempotency-Key": "h-tx-3"}),
+                ({"resourceType": "Bundle", "type": "transaction", "entry": [self.entry("DELETE", "Observation/o-1")]}, {}),
+            ):
+                status, headers, body = http_request(port, "POST", "/fhir", payload, headers_in)
+                self.assertEqual(400, status)
+                self.assertEqual("application/fhir+json", headers.get("content-type"))
+                self.assertEqual("invalid", body["issue"][0]["code"])
+            self.assertEqual("1", http_request(port, "GET", "/fhir/Observation/o-1")[2]["meta"]["versionId"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_http_invalid_json_is_a_fhir_400(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.service))
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = Request(
+                f"http://127.0.0.1:{port}/fhir",
+                data=b"{not json",
+                headers={"Content-Type": "application/json", "Idempotency-Key": "h-bad"},
+                method="POST",
+            )
+            try:
+                with _OPENER.open(request, timeout=5) as response:
+                    status, headers, body = response.status, response.headers, json.loads(response.read())
+            except HTTPError as error:
+                status, headers, body = error.code, error.headers, json.loads(error.read())
+            self.assertEqual(400, status)
+            self.assertEqual("application/fhir+json", headers.get("content-type"))
+            self.assertEqual("invalid", body["issue"][0]["code"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+
 if __name__ == "__main__":
     unittest.main()

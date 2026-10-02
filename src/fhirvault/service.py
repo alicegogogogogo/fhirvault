@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 from typing import Any, Callable
 
 from .errors import ConflictError, NotFoundError, OperationOutcomeError, ValidationError
 from .model import (
     RESOURCE_TYPES,
     REFERENCE_FIELDS,
+    TransactionEntry,
     ValidatedResource,
     criteria_match,
     fields_for,
@@ -14,6 +16,7 @@ from .model import (
     parse_if_match,
     parse_resource,
     parse_subscription,
+    parse_transaction,
     resolve_reference,
     search_match,
     validate_path_id,
@@ -158,27 +161,104 @@ class FhirVault:
     @_serialized
     def delete(self, resource_type: str, resource_id: str, key: str | None = None) -> dict[str, Any]:
         validate_path_id(resource_id)
+        return self._idempotent(key, f"delete:{resource_type}/{resource_id}", lambda: self._delete_apply(resource_type, resource_id))
+
+    def _delete_apply(self, resource_type: str, resource_id: str) -> dict[str, Any]:
+        row = self._require(resource_type, resource_id)
+        version = row["current_version"] + 1
+        moment = self.store.now()
+        document = self.store.decode(row["document"])
+        document["meta"] = {"versionId": str(version), "lastUpdated": moment}
+        connection = self.store.connection
+        connection.execute(
+            "UPDATE resources SET deleted = 1, current_version = ?, document = ?, last_updated = ? "
+            "WHERE type = ? AND id = ?",
+            (version, self.store.encode(document), moment, resource_type, resource_id),
+        )
+        connection.execute(
+            "INSERT INTO versions(type, id, version, document, recorded_at) VALUES (?, ?, ?, ?, ?)",
+            (resource_type, resource_id, version, self.store.encode(document), moment),
+        )
+        self._record_events(resource_type, resource_id, "deleted", version, document, moment)
+        return {"id": resource_id, "resourceType": resource_type, "deleted": True, "version": version, "lastUpdated": moment}
+
+    # ------------------------------------------------------------------ transactions
+
+    @_serialized
+    def transaction(self, raw: Any, key: str | None = None) -> dict[str, Any]:
+        """Apply a transaction Bundle atomically: every entry in order, or none."""
+        if not key:
+            raise OperationOutcomeError(400, "invalid", "Idempotency-Key header is required")
+        entries = parse_transaction(raw)
+        fingerprint = hashlib.sha256(self.store.encode(raw).encode("utf-8")).hexdigest()
 
         def apply() -> dict[str, Any]:
-            row = self._require(resource_type, resource_id)
-            version = row["current_version"] + 1
-            moment = self.store.now()
-            document = self.store.decode(row["document"])
-            document["meta"] = {"versionId": str(version), "lastUpdated": moment}
-            connection = self.store.connection
-            connection.execute(
-                "UPDATE resources SET deleted = 1, current_version = ?, document = ?, last_updated = ? "
-                "WHERE type = ? AND id = ?",
-                (version, self.store.encode(document), moment, resource_type, resource_id),
-            )
-            connection.execute(
-                "INSERT INTO versions(type, id, version, document, recorded_at) VALUES (?, ?, ?, ?, ?)",
-                (resource_type, resource_id, version, self.store.encode(document), moment),
-            )
-            self._record_events(resource_type, resource_id, "deleted", version, document, moment)
-            return {"id": resource_id, "resourceType": resource_type, "deleted": True, "version": version, "lastUpdated": moment}
+            return {
+                "resourceType": "Bundle",
+                "type": "transaction-response",
+                "entry": [self._apply_transaction_entry(entry) for entry in entries],
+            }
 
-        return self._idempotent(key, f"delete:{resource_type}/{resource_id}", apply)
+        try:
+            return self._idempotent(key, f"transaction:{fingerprint}", apply)
+        except ConflictError as error:
+            raise OperationOutcomeError(409, "conflict", str(error)) from error
+
+    def _apply_transaction_entry(self, entry: TransactionEntry) -> dict[str, Any]:
+        if entry.method == "POST":
+            validated = self._validate_entry_resource(entry.resource_type, entry.resource)
+            self._assert_entry_references(validated)
+            self._assert_absent(validated)
+            document = self._write(validated, reject_existing=True)
+            return self._transaction_result("201", validated, document)
+        if entry.method == "PUT":
+            expected = parse_if_match(entry.if_match)
+            validated = self._validate_entry_resource(entry.resource_type, entry.resource, expected_id=entry.resource_id)
+            self._assert_entry_references(validated)
+            document = self._write(validated, reject_existing=False, if_match=expected)
+            return self._transaction_result("200", validated, document)
+        try:
+            self._delete_apply(entry.resource_type, entry.resource_id)
+        except NotFoundError as error:
+            raise OperationOutcomeError(404, "not-found", str(error)) from error
+        return {
+            "response": {"status": "200", "location": f"/fhir/{entry.resource_type}/{entry.resource_id}"},
+            "resource": None,
+        }
+
+    @staticmethod
+    def _validate_entry_resource(resource_type: str, raw: Any, expected_id: str | None = None) -> ValidatedResource:
+        try:
+            return parse_resource(resource_type, raw, expected_id=expected_id)
+        except ValidationError as error:
+            raise OperationOutcomeError(400, "invalid", str(error)) from error
+
+    def _assert_entry_references(self, validated: ValidatedResource) -> None:
+        try:
+            self._assert_references(validated)
+        except ValidationError as error:
+            raise OperationOutcomeError(400, "invalid", str(error)) from error
+
+    def _assert_absent(self, validated: ValidatedResource) -> None:
+        row = self.store.connection.execute(
+            "SELECT 1 AS present FROM resources WHERE type = ? AND id = ?",
+            (validated.resource_type, validated.resource_id),
+        ).fetchone()
+        if row is not None:
+            raise OperationOutcomeError(
+                409, "conflict", f"{validated.resource_type}/{validated.resource_id} already exists"
+            )
+
+    @staticmethod
+    def _transaction_result(status: str, validated: ValidatedResource, document: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "response": {
+                "status": status,
+                "location": f"/fhir/{validated.resource_type}/{validated.resource_id}",
+                "etag": f'W/"{document["meta"]["versionId"]}"',
+            },
+            "resource": document,
+        }
 
     @_serialized
     def history(self, resource_type: str, resource_id: str) -> dict[str, Any]:
