@@ -19,6 +19,9 @@ The initial release intentionally supports a compact public contract:
   reference, with deterministic ordering;
 - subscriptions match `created`, `updated`, and `deleted` changes and record an
   ordered delivery event each time;
+- subscriptions may carry a webhook `channel`: each matching event is then also
+  POSTed to the channel endpoint with persistent retries (1s, then 2s), an
+  optional HMAC-SHA256 signature, and a queryable per-delivery attempt log;
 - `POST /fhir` applies a transaction Bundle atomically: every entry succeeds or
   the whole batch rolls back;
 - repeated state-changing requests with the same `Idempotency-Key` return the
@@ -385,6 +388,24 @@ subscription records an event for each `created`, `updated`, and `deleted`
 change; criteria are evaluated against the new stored document, and a delete
 matches against the last live version.
 
+A subscription may also carry an optional `channel` object that turns event
+recording into webhook delivery:
+
+```json
+{
+  "id": "sub-2",
+  "criteria": {"type": "Patient"},
+  "channel": {"endpoint": "https://hooks.example.com/fhir", "secret": "s3cr3t"}
+}
+```
+
+`channel` accepts exactly `endpoint` (required) and `secret` (optional).
+`endpoint` must be an absolute `http` or `https` URL without user info, a query
+string, or a fragment; `secret`, when present, must be a non-empty string. An
+invalid channel fails the whole create with HTTP 400 `validation_error` and
+stores nothing. Subscriptions without a channel keep the original behavior:
+matching writes only record events.
+
 ### Subscription delivery events
 
 ```http
@@ -407,6 +428,49 @@ Events are stored in the delivery log at the moment the write commits. Their
 `sequence` numbers are per subscription, start at 1, and are strictly
 increasing; a given `(subscription_id, sequence)` is never reused, so events
 are readable repeatedly and never duplicated.
+
+### Webhook deliveries
+
+```http
+GET /subscriptions/sub-2/deliveries
+```
+
+```json
+{
+  "subscription_id": "sub-2",
+  "total": 1,
+  "deliveries": [
+    {"sequence":1,"deliveryId":"9f1c...","state":"delivered","attempts":[
+      {"attempt":1,"attemptedAt":"2026-01-05T09:00:00.007Z","outcome":"failure","httpStatus":500,"error":"HTTP 500"},
+      {"attempt":2,"attemptedAt":"2026-01-05T09:00:01.009Z","outcome":"success","httpStatus":200,"error":null}
+    ]}
+  ]
+}
+```
+
+When a subscription has a `channel`, every matching write still records its
+event and additionally enqueues a delivery task in the same commit; the write
+response never waits for the webhook. A background worker POSTs the event JSON
+(the exact payload shown under `events`) to the endpoint with headers:
+
+- `X-FhirVault-Subscription` — the subscription id;
+- `X-FhirVault-Sequence` — the event sequence number;
+- `X-FhirVault-Delivery` — a unique delivery id;
+- `X-FhirVault-Signature` — only when a `secret` is set: the lowercase hex
+  HMAC-SHA256 of the raw request body bytes, keyed by the secret.
+
+Deliveries are listed by ascending `sequence`. Each delivery is `pending`
+until it finishes, `delivered` after any attempt succeeds (any 2xx status), or
+`failed` after three attempts have all failed (non-2xx status or a transport
+error). Failed attempts are retried 1 second after the first failure and 2
+seconds after the second, measured from the end of the previous attempt. Every
+attempt is logged with its `outcome` (`success`/`failure`), the response
+`httpStatus` (or `null` for transport errors), and an `error` reason (or
+`null`). Retries reuse the same delivery id, sequence, and signature so
+receivers can deduplicate uncertain redeliveries. Delivery tasks are persisted:
+restarting the service resumes pending deliveries, and querying the endpoint
+never triggers a delivery. A missing subscription answers HTTP 404
+`not_found`.
 
 ### Field reference
 

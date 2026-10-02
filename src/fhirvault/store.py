@@ -60,6 +60,23 @@ class Store:
               operation TEXT NOT NULL,
               response TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS subscription_channels (
+              subscription_id TEXT PRIMARY KEY REFERENCES subscriptions(id),
+              endpoint TEXT NOT NULL,
+              secret TEXT
+            );
+            CREATE TABLE IF NOT EXISTS deliveries (
+              subscription_id TEXT NOT NULL,
+              sequence INTEGER NOT NULL,
+              delivery_id TEXT NOT NULL,
+              endpoint TEXT NOT NULL,
+              secret TEXT,
+              payload TEXT NOT NULL,
+              state TEXT NOT NULL,
+              attempts TEXT NOT NULL,
+              next_attempt_at REAL,
+              PRIMARY KEY (subscription_id, sequence)
+            );
             """
         )
 

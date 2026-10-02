@@ -75,6 +75,8 @@ def make_handler(service: FhirVault) -> type[BaseHTTPRequestHandler]:
             if parts[:1] == ["subscriptions"]:
                 if self.command == "GET" and len(parts) == 3 and parts[2] == "events":
                     return 200, service.events(parts[1]), {}
+                if self.command == "GET" and len(parts) == 3 and parts[2] == "deliveries":
+                    return 200, service.deliveries(parts[1]), {}
                 raise NotFoundError("route was not found")
             raise NotFoundError("route was not found")
 
