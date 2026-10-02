@@ -6,6 +6,7 @@ from typing import Any, Callable
 from .errors import ConflictError, NotFoundError, OperationOutcomeError, ValidationError
 from .model import (
     RESOURCE_TYPES,
+    REFERENCE_FIELDS,
     ValidatedResource,
     criteria_match,
     fields_for,
@@ -20,6 +21,7 @@ from .model import (
 from .store import Store
 
 _CONTROL_PARAMETERS = ("_count", "_offset", "_sort")
+_EXPANSION_PARAMETERS = ("_include", "_revinclude")
 
 
 def _serialized(method: Callable) -> Callable:
@@ -212,12 +214,20 @@ class FhirVault:
     def search(self, resource_type: str, parameters: dict[str, list[str]]) -> dict[str, Any]:
         if resource_type not in RESOURCE_TYPES:
             raise NotFoundError(f"resource type {resource_type} is not supported")
-        unknown = set(parameters) - set(fields_for(resource_type)) - set(_CONTROL_PARAMETERS) - {"id"}
+        unknown = set(parameters) - set(fields_for(resource_type)) - set(_CONTROL_PARAMETERS) - set(_EXPANSION_PARAMETERS) - {"id"}
         if unknown:
             raise ValidationError(
                 f"unknown search parameters: {', '.join(sorted(unknown))}; supported parameters are "
-                f"{', '.join(sorted(set(fields_for(resource_type)) | {'id'} | set(_CONTROL_PARAMETERS)))}"
+                f"{', '.join(sorted(set(fields_for(resource_type)) | {'id'} | set(_CONTROL_PARAMETERS) | set(_EXPANSION_PARAMETERS)))}"
             )
+        includes = [
+            self._parse_include(value, resource_type, reverse=False)
+            for value in parameters.get("_include", [])
+        ]
+        revincludes = [
+            self._parse_include(value, resource_type, reverse=True)
+            for value in parameters.get("_revinclude", [])
+        ]
         count, offset = self._paging(parameters)
         sort = parameters.get("_sort", ["_id"])[0]
         rows = self.store.connection.execute(
@@ -236,22 +246,128 @@ class FhirVault:
                     for value in values
                 )
                 for field, values in parameters.items()
-                if field not in _CONTROL_PARAMETERS and field != "id"
+                if field not in _CONTROL_PARAMETERS and field not in _EXPANSION_PARAMETERS and field != "id"
             ):
                 continue
             matched.append((row["id"], document))
         matched.sort(key=lambda item: item[0], reverse=sort == "-_id")
         total = len(matched)
         page = matched[offset:] if count is None else matched[offset : offset + count]
-        return {
+        page_documents = [document for _, document in page]
+        result: dict[str, Any] = {
             "resourceType": resource_type,
             "total": total,
             "count": len(page),
             "offset": offset,
             "sort": sort,
             "parameters": {name: sorted(values) for name, values in sorted(parameters.items())},
-            "entry": [{"resource": document} for _, document in page],
+            "entry": [{"resource": document} for document in page_documents],
         }
+        if includes or revincludes:
+            included, revincluded = self._expand(resource_type, page_documents, includes, revincludes)
+            result["include"] = included
+            result["revinclude"] = revincluded
+        return result
+
+    @staticmethod
+    def _parse_include(value: str, primary_type: str, *, reverse: bool) -> tuple[str, str]:
+        """Validate an ``_include``/``_revinclude`` value of ``type:field``.
+
+        Forward includes name the primary search type; reverse includes name the
+        type that points back at the primary results. In both cases the field
+        must be a reference field of the named type.
+        """
+        label = "_revinclude" if reverse else "_include"
+        parts = value.split(":")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise ValidationError(f"{label} must have the form <resourceType>:<referenceField>")
+        named_type, field = parts
+        if named_type not in RESOURCE_TYPES:
+            raise ValidationError(
+                f"{label} resource type {named_type} is not supported; supported types are "
+                f"{', '.join(RESOURCE_TYPES)}"
+            )
+        if not reverse and named_type != primary_type:
+            raise ValidationError(f"_include resource type must be {primary_type}, not {named_type}")
+        if field not in REFERENCE_FIELDS[named_type]:
+            supported = ", ".join(REFERENCE_FIELDS[named_type]) or "none"
+            raise ValidationError(
+                f"{label} field {field} is not a reference field of {named_type}; "
+                f"reference fields are: {supported}"
+            )
+        return named_type, field
+
+    def _expand(
+        self,
+        primary_type: str,
+        page: list[dict[str, Any]],
+        includes: list[tuple[str, str]],
+        revincludes: list[tuple[str, str]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Resolve one hop of forward and reverse includes over one page."""
+        connection = self.store.connection
+        primary_ids = {document["id"] for document in page}
+        primary_keys = {(primary_type, document["id"]) for document in page}
+
+        def load(target_type: str, target_id: str) -> dict[str, Any] | None:
+            row = connection.execute(
+                "SELECT document FROM resources WHERE type = ? AND id = ? AND deleted = 0",
+                (target_type, target_id),
+            ).fetchone()
+            return self.store.decode(row["document"]) if row is not None else None
+
+        forward: dict[tuple[str, str], dict[str, Any]] = {}
+        for _, field in includes:
+            for document in page:
+                stored = document.get(field)
+                reference = stored.get("reference") if isinstance(stored, dict) else None
+                if not isinstance(reference, str):
+                    continue
+                target_id = self._resolve_target(connection, primary_type, field, reference)
+                if target_id is None:
+                    continue
+                key = (reference.partition("/")[0], target_id)
+                if key in primary_keys or key in forward:
+                    continue
+                target = load(*key)
+                if target is not None:
+                    forward[key] = target
+
+        reverse: dict[tuple[str, str], dict[str, Any]] = {}
+        if revincludes and primary_ids:
+            for referencing_type, field in revincludes:
+                rows = connection.execute(
+                    "SELECT id, document FROM resources WHERE type = ? AND deleted = 0",
+                    (referencing_type,),
+                ).fetchall()
+                for row in rows:
+                    key = (referencing_type, row["id"])
+                    if key in primary_keys or key in reverse:
+                        continue
+                    document = self.store.decode(row["document"])
+                    stored = document.get(field)
+                    reference = stored.get("reference") if isinstance(stored, dict) else None
+                    if not isinstance(reference, str):
+                        continue
+                    target_type = reference.partition("/")[0]
+                    if target_type != primary_type:
+                        continue
+                    target_id = self._resolve_target(connection, referencing_type, field, reference)
+                    if target_id is not None and target_id in primary_ids:
+                        reverse[key] = document
+
+        def ordered(resolved: dict[tuple[str, str], dict[str, Any]]) -> list[dict[str, Any]]:
+            return [resolved[key] for key in sorted(resolved)]
+
+        return ordered(forward), ordered(reverse)
+
+    @staticmethod
+    def _resolve_target(connection: Any, owner_type: str, field: str, reference: str) -> str | None:
+        """Resolve a reference to a live target id, or None when unresolvable."""
+        try:
+            return resolve_reference(connection, owner_type, field, reference)
+        except (ValidationError, OperationOutcomeError):
+            return None
 
     @staticmethod
     def _paging(parameters: dict[str, list[str]]) -> tuple[int | None, int]:

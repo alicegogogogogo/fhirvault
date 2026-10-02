@@ -228,6 +228,62 @@ GET /fhir/Observation?code.text=HbA&subject=Patient/p-1&_count=10&_offset=0&_sor
   `_id` or `-_id`, and `id=...` filters by resource id. Unknown parameters are
   rejected with `validation_error`.
 
+### One-hop include expansion
+
+A search can carry repeated `_include` and `_revinclude` parameters to pull in
+resources linked to the page's primary entries. Expansion is exactly one hop.
+
+- `_include=<resourceType>:<referenceField>` — `resourceType` must equal the
+  primary search type and `referenceField` must be one of its reference fields.
+  Every referenced live target of the page's primary entries is returned, for
+  example `GET /fhir/Observation?_include=Observation:subject` includes the
+  referenced `Patient` resources.
+- `_revinclude=<referencingType>:<referenceField>` — returns live resources of
+  `referencingType` whose `referenceField` resolves to any primary result, for
+  example `GET /fhir/Patient?_revinclude=Observation:subject` includes the
+  related `Observation` resources.
+
+Both id references (`Patient/p-1`) and identifier references
+(`Patient/identifier|<system>|<value>`) follow the same resolution rules as
+writes; reverse matching compares against the resolved target. Only current,
+live, resolvable targets are included — deleted resources and dangling
+references are skipped.
+
+```json
+{
+  "resourceType": "Observation",
+  "total": 1,
+  "count": 1,
+  "offset": 0,
+  "sort": "_id",
+  "parameters": {"_include": ["Observation:encounter", "Observation:subject"]},
+  "entry": [{"resource": {"id": "o-1", "...": "...",
+                          "subject": {"reference": "Patient/p-1"},
+                          "encounter": {"reference": "Encounter/e-1"}}}],
+  "include": [
+    {"resourceType": "Encounter", "id": "e-1", "...": "..."},
+    {"resourceType": "Patient", "id": "p-1", "...": "..."}
+  ],
+  "revinclude": []
+}
+```
+
+- `include` and `revinclude` hold the full expanded resource documents, sorted by
+  `resourceType` then `id` and deduplicated by `resourceType/id`. Repeated
+  parameters are evaluated separately and their results merged.
+- Expanded resources never count toward `total`, `count`, or `entry`, and primary
+  entry resources are never copied into an expansion array (even when the
+  referencing type equals the primary type). The same resource may appear in both
+  arrays when it satisfies both kinds of request.
+- Expansion runs after filtering, sorting, and paging, so only targets of the
+  returned page are expanded. An empty `entry` yields empty arrays.
+- When neither parameter is present the response is unchanged: the `include` and
+  `revinclude` keys are omitted entirely.
+- A malformed value, an unsupported `resourceType`/`referencingType`, a
+  `referenceField` that does not exist or is not a reference field, or an
+  `_include` whose type is not the primary type all fail the whole request with
+  HTTP 400 `validation_error` — partial results are never returned.
+
 ### Create a subscription
 
 ```http
