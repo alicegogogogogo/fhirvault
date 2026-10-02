@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
 
-from .errors import ConflictError, NotFoundError, ValidationError
+from .errors import (
+    ConflictError,
+    InvalidPreconditionError,
+    NotFoundError,
+    PreconditionFailedError,
+    PreconditionTargetMissingError,
+    ValidationError,
+)
 from .model import (
     RESOURCE_TYPES,
     ValidatedResource,
@@ -18,6 +26,44 @@ from .model import (
 from .store import Store
 
 _CONTROL_PARAMETERS = ("_count", "_offset", "_sort")
+
+# Bytes permitted inside an opaque-tag (RFC 7232): VCHAR minus DQUOTE, here
+# restricted to ASCII (etagc also allows obs-text, which this service never emits).
+_ETAGC = re.compile(r"^[\x21\x23-\x7e]*$")
+
+
+def parse_if_match(header: str) -> list[tuple[bool, str]] | str:
+    """Parse an If-Match header value.
+
+    Returns ``"*"`` for the wildcard, otherwise a list of ``(weak, etag)``
+    pairs where ``etag`` is the unquoted opaque tag (the resource version
+    identifier). Raises InvalidPreconditionError when the header is not a
+    valid ``"*"`` or comma-separated list of entity-tags.
+    """
+    value = header.strip(" \t")
+    if value == "*":
+        return "*"
+    tags: list[tuple[bool, str]] = []
+    for element in value.split(","):
+        token = element.strip(" \t")
+        weak = False
+        if token[:2].upper() == "W/":
+            weak = True
+            token = token[2:].strip(" \t")
+        if len(token) < 2 or token[0] != '"' or token[-1] != '"' or not _ETAGC.match(token[1:-1]):
+            raise InvalidPreconditionError(
+                "If-Match must be '*' or a comma-separated list of entity-tags such as "
+                f'"10" or W/"10"; received {header!r}'
+            )
+        tags.append((weak, token[1:-1]))
+    if not tags:
+        raise InvalidPreconditionError("If-Match must contain at least one entity-tag")
+    return tags
+
+
+def etag_for(version_id: Any) -> str:
+    """The strong ETag used for both read responses and update preconditions."""
+    return f'"{version_id}"'
 
 
 class FhirVault:
@@ -106,15 +152,47 @@ class FhirVault:
         row = self._require(resource_type, resource_id)
         return self.store.decode(row["document"])
 
-    def update(self, resource_type: str, resource_id: str, raw: Any, key: str | None = None) -> dict[str, Any]:
+    def update(
+        self,
+        resource_type: str,
+        resource_id: str,
+        raw: Any,
+        key: str | None = None,
+        if_match: str | None = None,
+    ) -> dict[str, Any]:
         validate_path_id(resource_id)
+        condition = parse_if_match(if_match) if if_match is not None else None
         validated = parse_resource(resource_type, raw, expected_id=resource_id)
         self._assert_references(validated)
-        return self._idempotent(
-            key,
-            f"update:{resource_type}/{resource_id}",
-            lambda: self._write(validated, reject_existing=False),
-        )
+
+        def apply() -> dict[str, Any]:
+            # The lock plus the BEGIN IMMEDIATE transaction make the version
+            # check and the write atomic: concurrent conditional updates commit
+            # in reception order, and the loser re-reads the winner's version.
+            with self.store.write_lock:
+                if condition is not None:
+                    self._check_precondition(resource_type, resource_id, condition, if_match)
+                return self._write(validated, reject_existing=False)
+
+        return self._idempotent(key, f"update:{resource_type}/{resource_id}", apply)
+
+    def _check_precondition(
+        self,
+        resource_type: str,
+        resource_id: str,
+        condition: Any,
+        raw_header: str | None,
+    ) -> None:
+        row = self.store.connection.execute(
+            "SELECT current_version, deleted FROM resources WHERE type = ? AND id = ?",
+            (resource_type, resource_id),
+        ).fetchone()
+        if row is None or row["deleted"]:
+            raise PreconditionTargetMissingError(resource_type, resource_id)
+        current = str(row["current_version"])
+        if condition != "*" and not any(tag == current for _weak, tag in condition):
+            provided = (raw_header or "").strip(" \t")
+            raise PreconditionFailedError(resource_type, resource_id, provided, current)
 
     def delete(self, resource_type: str, resource_id: str, key: str | None = None) -> dict[str, Any]:
         validate_path_id(resource_id)

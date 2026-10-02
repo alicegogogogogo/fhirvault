@@ -12,6 +12,7 @@ The initial release intentionally supports a compact public contract:
 - full CRUD per resource, with server-managed `meta.versionId`;
 - every write appends an immutable version; versions never decrease and old
   versions stay readable, including after a delete;
+- optimistic concurrency control on `PUT` via `If-Match` and version `ETag`s;
 - `reference` links must resolve to a live resource that is already stored;
 - conditional search by exact value, by prefix for string fields, and by
   reference, with deterministic ordering;
@@ -75,6 +76,11 @@ Returns HTTP 201 with the stored resource. A duplicate id returns HTTP 409
 GET /fhir/Patient/p-1
 ```
 
+Successful read responses also carry an `ETag` header holding the current
+version (`ETag: "1"`). The value is a valid `If-Match` precondition: read a
+resource, note its `ETag`, and send it back on `PUT` to fail instead of
+silently overwriting a version another client committed in the meantime.
+
 ```json
 {
   "resourceType": "Patient",
@@ -102,6 +108,53 @@ otherwise stores the next version of the same logical resource, returning HTTP
 200 with the new `meta.versionId`. The body `id` must equal the path id. A
 resource that was deleted can be recreated with `PUT`; the version sequence
 continues (`1`, `2`, `3`, …) and is never reused.
+
+A successful `PUT` returns the updated resource with an `ETag` header for the
+new version (for example `ETag: "2"`) and a `Location` header pointing at the
+current content (`http://<host>/fhir/Patient/p-1`).
+
+### Conditional update with If-Match
+
+```http
+PUT /fhir/Patient/p-1
+Idempotency-Key: patient-1-v2
+If-Match: "1"
+
+{"resourceType":"Patient","id":"p-1","gender":"female","birthDate":"1980-04-12","name.family":"Smith"}
+```
+
+Add an `If-Match` header to update only when the version you read is still
+current:
+
+- `If-Match: "<versionId>"` — matches when the quoted value equals the
+  resource's current version;
+- `W/"<versionId>"` — the weak form matches whenever the version identifier is
+  the same as the strong form;
+- `If-Match: *` — matches whenever the target resource currently exists;
+- a comma-separated list of entity-tags matches when any tag equals the current
+  version;
+- a missing `If-Match` header keeps the unconditional overwrite semantics
+  described above (a missing header is never an error).
+
+Conditional-update failures are returned as an `application/fhir+json`
+`OperationOutcome` and never create a version or change history:
+
+| condition | status | `issue.code` |
+| --- | --- | --- |
+| `If-Match` is syntactically invalid | 400 | `invalid` |
+| target resource does not exist (or is deleted) | 404 | `not-found` |
+| none of the supplied versions is current | 412 | `conflict` |
+
+The 412 `diagnostics` states that the supplied version is not the current
+version (and names the current one). Body structure and reference validation
+still run before any write: a failed validation returns the existing
+`validation_error` and appends no version.
+
+Concurrent conditional updates commit in the order the server receives them:
+when two clients both read version 10 and send `If-Match: "10"`, the first to
+be processed creates version 11 with HTTP 200, and the second receives 412 with
+no extra version. A `PUT` without `If-Match` still overwrites newer content
+unconditionally.
 
 ### Delete a resource
 
@@ -301,6 +354,26 @@ never point at a resource type the vault does not store.
 | `not_found` | 404 | unknown resource id, unknown resource type, unknown route, unknown subscription |
 | `conflict` | 409 | duplicate create, or an idempotency key reused for another operation |
 | `internal_error` | 500 | unexpected failure |
+
+Conditional-update failures (`If-Match`) instead return a FHIR
+`OperationOutcome` with `Content-Type: application/fhir+json`:
+
+```json
+{
+  "resourceType": "OperationOutcome",
+  "issue": [
+    {
+      "severity": "error",
+      "code": "conflict",
+      "diagnostics": "the version supplied in If-Match (\"1\") is not the current version of Patient/p-1; current version is \"2\""
+    }
+  ]
+}
+```
+
+The `issue.code` is `invalid` (400), `not-found` (404), or `conflict` (412) as
+described in [Conditional update with If-Match](#conditional-update-with-if-match).
+All other error responses keep the `{"error":{...}}` envelope above.
 
 ## Tests
 
