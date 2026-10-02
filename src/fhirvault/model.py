@@ -272,6 +272,66 @@ def resolve_reference(connection: Any, resource_type: str, field: str, reference
     return rest
 
 
+def try_resolve_reference(connection: Any, reference: str) -> tuple[str, str] | None:
+    """Resolve a reference to ``(type, id)`` for a single live resource, or None.
+
+    Same resolution rules as :func:`resolve_reference` (id or identifier), but
+    read paths use it to skip deleted, missing, malformed, or ambiguous targets
+    instead of failing the request.
+    """
+    target_type, _, rest = reference.partition("/")
+    if target_type not in RESOURCE_TYPES or not rest:
+        return None
+    if rest.startswith("identifier"):
+        parts = rest.split("|")
+        if len(parts) != 3 or not parts[1] or not parts[2]:
+            return None
+        wanted = f"{parts[1]}|{parts[2]}"
+        rows = connection.execute(
+            "SELECT id, document FROM resources WHERE type = ? AND deleted = 0 ORDER BY id",
+            (target_type,),
+        ).fetchall()
+        matches = [row["id"] for row in rows if wanted in identifiers_of(json.loads(row["document"]))]
+        if len(matches) != 1:
+            return None
+        return target_type, matches[0]
+    row = connection.execute(
+        "SELECT id FROM resources WHERE type = ? AND id = ? AND deleted = 0", (target_type, rest)
+    ).fetchone()
+    if row is None:
+        return None
+    return target_type, rest
+
+
+def parse_include_spec(value: str, primary_type: str, *, reverse: bool) -> tuple[str, str]:
+    """Validate one ``_include``/``_revinclude`` value as ``<type>:<referenceField>``.
+
+    ``_include`` requires the type to equal the searched resource type;
+    ``_revinclude`` accepts any stored type. The field must be a reference field
+    of that type. Anything else is a ``validation_error``.
+    """
+    label = "_revinclude" if reverse else "_include"
+    type_label = "referencingType" if reverse else "resourceType"
+    parts = value.split(":")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValidationError(f"{label} must be <{type_label}>:<referenceField>")
+    referenced_type, field = parts
+    if referenced_type not in RESOURCE_TYPES:
+        raise ValidationError(
+            f"{label} {type_label} must be one of: {', '.join(RESOURCE_TYPES)}"
+        )
+    if not reverse and referenced_type != primary_type:
+        raise ValidationError(f"_include resourceType must equal the searched type {primary_type}")
+    reference_fields = REFERENCE_FIELDS[referenced_type]
+    if field not in reference_fields:
+        if reference_fields:
+            detail = f"reference fields of {referenced_type} are: {', '.join(reference_fields)}"
+        else:
+            detail = f"{referenced_type} has no reference fields"
+        raise ValidationError(f"{label} field {field} is not a reference field; {detail}")
+    return referenced_type, field
+
+
 def identifiers_of(document: dict[str, Any]) -> tuple[str, ...]:
     entries = document.get("identifier")
     if not isinstance(entries, list):

@@ -228,6 +228,55 @@ GET /fhir/Observation?code.text=HbA&subject=Patient/p-1&_count=10&_offset=0&_sor
   `_id` or `-_id`, and `id=...` filters by resource id. Unknown parameters are
   rejected with `validation_error`.
 
+### One-hop include expansion
+
+```http
+GET /fhir/Observation?_include=Observation:subject&_revinclude=Observation:subject
+```
+
+The search above adds two arrays to the response:
+
+```json
+{
+  "resourceType": "Observation",
+  "total": 1,
+  "count": 1,
+  "offset": 0,
+  "sort": "_id",
+  "parameters": {"_include": ["Observation:subject"], "_revinclude": ["Observation:subject"]},
+  "entry": [{"resource": {"resourceType": "Observation", "id": "o-1", "subject": {"reference": "Patient/p-1"}, ...}}],
+  "include": [{"resourceType": "Patient", "id": "p-1", ...}],
+  "revinclude": []
+}
+```
+
+- `_include` takes `resourceType:referenceField`, where `resourceType` must equal
+  the searched type and `referenceField` must be one of its reference fields.
+  It expands targets the page's main results point at, e.g.
+  `_include=Observation:subject` returns the referenced `Patient` resources.
+- `_revinclude` takes `referencingType:referenceField` and returns live
+  resources of that type whose field resolves to any resource on the page, e.g.
+  searching `Patient` with `_revinclude=Observation:subject` returns the related
+  observations.
+- Both parameters may be repeated; each value is evaluated independently and
+  the results are merged. Expansion is exactly one hop and is applied to the
+  entries of the requested page (after sorting, `_count`, and `_offset`).
+- `id` references and `identifier` references use the normal resolution rules;
+  reverse matching compares resolved targets, so an identifier reference that
+  resolves to a page resource matches.
+- `include` and `revinclude` hold complete resource documents, sorted by
+  `resourceType` then `id` ascending and deduplicated by `resourceType`/`id`.
+  They never contribute to `total`, `count`, or `entry`; main entry resources
+  are not copied into the expansion arrays. A resource matching one parameter
+  of each kind may appear in both arrays.
+- Only currently live, resolvable targets are returned; deleted resources and
+  dangling references are silently skipped. When `entry` is empty both arrays
+  are empty. The arrays are present only when the corresponding parameter was
+  supplied; a query with neither parameter returns exactly the previous shape.
+- A malformed parameter value, an unsupported `resourceType`/`referencingType`,
+  or a field that does not exist or is not a reference field fails the whole
+  request with HTTP 400 `validation_error`; no partial results are returned.
+
 ### Create a subscription
 
 ```http

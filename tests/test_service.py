@@ -278,6 +278,134 @@ class FhirVaultTests(unittest.TestCase):
         self.service.delete("Patient", "p-6", "k32")
         self.assertEqual(["p-1"], [entry["resource"]["id"] for entry in self.service.search("Patient", {})["entry"]])
 
+    # ---------------------------------------------------------------- include / revinclude
+
+    def _setup_include_graph(self):
+        self.service.create(
+            "Patient",
+            patient("p-2", gender="female", **{"name.family": "Jones", "identifier": [{"system": "mrn", "value": "B456"}]}),
+            "i1",
+        )
+        self.service.create("Observation", observation("o-1", subject="Patient/p-1"), "i2")
+        self.service.create("Observation", observation("o-2", subject="Patient/identifier|mrn|A123", value=1.0), "i3")
+        self.service.create("Observation", observation("o-3", subject="Patient/p-2"), "i4")
+        o4 = observation("o-4", status="preliminary")
+        del o4["subject"]
+        self.service.create("Observation", o4, "i5")
+        self.service.create("Encounter", encounter("e-1", subject="Patient/p-1"), "i6")
+
+    def test_forward_include_returns_referenced_live_resources(self):
+        self._setup_include_graph()
+        found = self.service.search("Observation", {"_include": ["Observation:subject"]})
+        self.assertEqual(["o-1", "o-2", "o-3", "o-4"], [entry["resource"]["id"] for entry in found["entry"]])
+        self.assertEqual(4, found["total"])
+        self.assertEqual(4, found["count"])
+        self.assertEqual(["p-1", "p-2"], [document["id"] for document in found["include"]])
+        self.assertNotIn("revinclude", found)
+
+    def test_forward_include_supports_identifier_references_and_dedup(self):
+        self._setup_include_graph()
+        found = self.service.search("Observation", {"id": ["o-2"], "_include": ["Observation:subject"]})
+        self.assertEqual(["p-1"], [document["id"] for document in found["include"]])
+
+    def test_reverse_include_returns_resources_pointing_at_the_page(self):
+        self._setup_include_graph()
+        found = self.service.search("Patient", {"_revinclude": ["Observation:subject", "Encounter:subject"]})
+        self.assertEqual(["p-1", "p-2"], [entry["resource"]["id"] for entry in found["entry"]])
+        self.assertEqual(
+            [("Encounter", "e-1"), ("Observation", "o-1"), ("Observation", "o-2"), ("Observation", "o-3")],
+            [(document["resourceType"], document["id"]) for document in found["revinclude"]],
+        )
+        self.assertNotIn("include", found)
+
+    def test_include_is_evaluated_after_paging_and_not_counted(self):
+        self._setup_include_graph()
+        page = self.service.search("Observation", {"_sort": ["_id"], "_count": ["1"], "_offset": ["2"], "_include": ["Observation:subject"]})
+        self.assertEqual(4, page["total"])
+        self.assertEqual(1, page["count"])
+        self.assertEqual(["o-3"], [entry["resource"]["id"] for entry in page["entry"]])
+        self.assertEqual(["p-2"], [document["id"] for document in page["include"]])
+
+    def test_include_and_revinclude_can_each_hold_the_same_resource(self):
+        self._setup_include_graph()
+        # Observations referencing observations via hasMember: o-10 points at o-1.
+        self.service.create("Observation", observation("o-10", hasMember="Observation/o-1", **{"code.text": "Z"}), "i7")
+        found = self.service.search("Observation", {"id": ["o-1"], "_include": ["Observation:hasMember"], "_revinclude": ["Observation:hasMember"]})
+        self.assertEqual(["o-1"], [entry["resource"]["id"] for entry in found["entry"]])
+        self.assertEqual([], found["include"])
+        self.assertEqual(["o-10"], [document["id"] for document in found["revinclude"]])
+        forward = self.service.search("Observation", {"id": ["o-10"], "_include": ["Observation:hasMember"]})
+        self.assertEqual(["o-1"], [document["id"] for document in forward["include"]])
+
+    def test_primary_entries_are_not_copied_into_expansion_arrays(self):
+        self._setup_include_graph()
+        self.service.create("Encounter", encounter("e-2", subject="Patient/p-1", partOf="Encounter/e-1"), "i8")
+        found = self.service.search("Encounter", {"id": ["e-1"], "_revinclude": ["Encounter:partOf"]})
+        self.assertEqual(["e-2"], [document["id"] for document in found["revinclude"]])
+        self.service.create("Observation", observation("o-11", hasMember="Observation/o-1", **{"code.text": "W"}), "i9")
+        forward = self.service.search("Observation", {"id": ["o-11"], "_include": ["Observation:hasMember"], "_revinclude": ["Observation:hasMember"]})
+        self.assertEqual(["o-1"], [document["id"] for document in forward["include"]])
+        self.assertEqual([], forward["revinclude"])
+
+    def test_deleted_and_unresolvable_targets_are_skipped(self):
+        self._setup_include_graph()
+        self.service.delete("Patient", "p-2", "i10")
+        found = self.service.search("Observation", {"id": ["o-3"], "_include": ["Observation:subject"]})
+        self.assertEqual([], found["include"])
+        self.service.delete("Observation", "o-1", "i11")
+        reverse = self.service.search("Patient", {"id": ["p-1"], "_revinclude": ["Observation:subject"]})
+        self.assertEqual(
+            ["o-2"], [document["id"] for document in reverse["revinclude"]]
+        )
+
+    def test_empty_entry_yields_empty_expansion_arrays(self):
+        self._setup_include_graph()
+        found = self.service.search("Observation", {"id": ["missing"], "_include": ["Observation:subject"], "_revinclude": ["Observation:subject"]})
+        self.assertEqual([], found["entry"])
+        self.assertEqual([], found["include"])
+        self.assertEqual([], found["revinclude"])
+
+    def test_repeated_include_parameters_merge_and_dedup(self):
+        self._setup_include_graph()
+        found = self.service.search("Observation", {"_include": ["Observation:subject", "Observation:subject", "Observation:encounter"]})
+        self.assertEqual(["p-1", "p-2"], [document["id"] for document in found["include"]])
+        self.assertEqual(
+            ["Observation:encounter", "Observation:subject", "Observation:subject"],
+            found["parameters"]["_include"],
+        )
+
+    def test_search_without_include_parameters_keeps_its_shape(self):
+        self._setup_include_graph()
+        found = self.service.search("Observation", {})
+        self.assertNotIn("include", found)
+        self.assertNotIn("revinclude", found)
+
+    def test_bad_include_parameters_are_validation_errors_without_partial_results(self):
+        self._setup_include_graph()
+        bad_values = [
+            ("_include", "Patient:subject", "must equal the searched type"),
+            ("_include", "Observation:gender", "not a reference field"),
+            ("_include", "Observation:missing", "not a reference field"),
+            ("_include", "Device:subject", "must be one of"),
+            ("_include", "Observation", "<referenceField>"),
+            ("_include", "", "<referenceField>"),
+            ("_include", "Observation:subject:extra", "<referenceField>"),
+            ("_revinclude", "Patient:gender", "not a reference field"),
+            ("_revinclude", "Patient:subject", "no reference fields"),
+            ("_revinclude", "Device:subject", "must be one of"),
+        ]
+        for name, value, message in bad_values:
+            with self.assertRaisesRegex(ValidationError, message, msg=value):
+                self.service.search("Observation", {name: [value]})
+        # A good spec followed by a bad one must not return partial results.
+        with self.assertRaises(ValidationError):
+            self.service.search("Observation", {"_include": ["Observation:subject", "Observation:bad"]})
+
+    def test_include_validation_runs_before_paging_validation(self):
+        self._setup_include_graph()
+        with self.assertRaisesRegex(ValidationError, "must equal the searched type"):
+            self.service.search("Observation", {"_include": ["Patient:subject"], "_count": ["9999"]})
+
     # ---------------------------------------------------------------- subscriptions
 
     def test_subscription_receives_matching_events_only(self):
@@ -478,6 +606,26 @@ class FhirVaultTests(unittest.TestCase):
             multi = self.request("GET", "/fhir/Patient?gender=male&gender=female")
             self.assertEqual(200, multi[0])
             self.assertEqual(["p-1", "p-20"], [entry["resource"]["id"] for entry in multi[1]["entry"]])
+            status, body = self.request(
+                "GET",
+                "/fhir/Observation?_include=Observation:subject&_revinclude=Observation:subject",
+            )
+            self.assertEqual(200, status)
+            self.assertEqual(["o-20"], [entry["resource"]["id"] for entry in body["entry"]])
+            self.assertEqual(["p-20"], [document["id"] for document in body["include"]])
+            self.assertEqual([], body["revinclude"])
+            status, body = self.request("GET", "/fhir/Patient?_revinclude=Observation:subject")
+            self.assertEqual(200, status)
+            self.assertEqual(["o-20"], [document["id"] for document in body["revinclude"]])
+            status, body = self.request("GET", "/fhir/Observation?_include=Patient:subject")
+            self.assertEqual(400, status)
+            self.assertEqual("validation_error", body["error"]["code"])
+            status, body = self.request("GET", "/fhir/Observation?_include=Observation:nope")
+            self.assertEqual(400, status)
+            self.assertEqual("validation_error", body["error"]["code"])
+            status, body = self.request("GET", "/fhir/Patient?_revinclude=Device:subject")
+            self.assertEqual(400, status)
+            self.assertEqual("validation_error", body["error"]["code"])
             self.assertEqual(400, self.request("POST", "/fhir/Patient", patient("p-30"))[0])
             self.assertEqual(201, self.request("POST", "/fhir/Patient", patient("p-31", gender="female"), {"Idempotency-Key": "h7"})[0])
             self.assertEqual(409, self.request("POST", "/fhir/Patient", patient("p-31"), {"Idempotency-Key": "h8"})[0])

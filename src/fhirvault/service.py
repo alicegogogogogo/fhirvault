@@ -11,15 +11,18 @@ from .model import (
     fields_for,
     identifiers_of,
     parse_if_match,
+    parse_include_spec,
     parse_resource,
     parse_subscription,
     resolve_reference,
     search_match,
+    try_resolve_reference,
     validate_path_id,
 )
 from .store import Store
 
 _CONTROL_PARAMETERS = ("_count", "_offset", "_sort")
+_INCLUDE_PARAMETERS = ("_include", "_revinclude")
 
 
 def _serialized(method: Callable) -> Callable:
@@ -212,12 +215,28 @@ class FhirVault:
     def search(self, resource_type: str, parameters: dict[str, list[str]]) -> dict[str, Any]:
         if resource_type not in RESOURCE_TYPES:
             raise NotFoundError(f"resource type {resource_type} is not supported")
-        unknown = set(parameters) - set(fields_for(resource_type)) - set(_CONTROL_PARAMETERS) - {"id"}
+        unknown = (
+            set(parameters)
+            - set(fields_for(resource_type))
+            - set(_CONTROL_PARAMETERS)
+            - {"id"}
+            - set(_INCLUDE_PARAMETERS)
+        )
         if unknown:
             raise ValidationError(
                 f"unknown search parameters: {', '.join(sorted(unknown))}; supported parameters are "
-                f"{', '.join(sorted(set(fields_for(resource_type)) | {'id'} | set(_CONTROL_PARAMETERS)))}"
+                f"{', '.join(sorted(set(fields_for(resource_type)) | {'id'} | set(_CONTROL_PARAMETERS) | set(_INCLUDE_PARAMETERS)))}"
             )
+        # Validate every expansion parameter before touching the data so a bad
+        # spec always fails the whole request with no partial results.
+        include_specs = [
+            parse_include_spec(value, resource_type, reverse=False)
+            for value in parameters.get("_include", [])
+        ]
+        revinclude_specs = [
+            parse_include_spec(value, resource_type, reverse=True)
+            for value in parameters.get("_revinclude", [])
+        ]
         count, offset = self._paging(parameters)
         sort = parameters.get("_sort", ["_id"])[0]
         rows = self.store.connection.execute(
@@ -236,14 +255,14 @@ class FhirVault:
                     for value in values
                 )
                 for field, values in parameters.items()
-                if field not in _CONTROL_PARAMETERS and field != "id"
+                if field not in _CONTROL_PARAMETERS and field != "id" and field not in _INCLUDE_PARAMETERS
             ):
                 continue
             matched.append((row["id"], document))
         matched.sort(key=lambda item: item[0], reverse=sort == "-_id")
         total = len(matched)
         page = matched[offset:] if count is None else matched[offset : offset + count]
-        return {
+        result: dict[str, Any] = {
             "resourceType": resource_type,
             "total": total,
             "count": len(page),
@@ -252,6 +271,64 @@ class FhirVault:
             "parameters": {name: sorted(values) for name, values in sorted(parameters.items())},
             "entry": [{"resource": document} for _, document in page],
         }
+        if "_include" in parameters:
+            result["include"] = self._forward_includes(resource_type, page, include_specs)
+        if "_revinclude" in parameters:
+            result["revinclude"] = self._reverse_includes(resource_type, page, revinclude_specs)
+        return result
+
+    def _load_include_documents(self, keys: set[tuple[str, str]]) -> list[dict[str, Any]]:
+        """Return complete live documents for the given keys, sorted by type/id."""
+        documents: list[dict[str, Any]] = []
+        for target_type, target_id in sorted(keys):
+            row = self.store.connection.execute(
+                "SELECT document FROM resources WHERE type = ? AND id = ? AND deleted = 0",
+                (target_type, target_id),
+            ).fetchone()
+            if row is not None:
+                documents.append(self.store.decode(row["document"]))
+        return documents
+
+    def _forward_includes(
+        self,
+        primary_type: str,
+        page: list[tuple[str, dict[str, Any]]],
+        specs: list[tuple[str, str]],
+    ) -> list[dict[str, Any]]:
+        primary_keys = {(primary_type, resource_id) for resource_id, _ in page}
+        targets: set[tuple[str, str]] = set()
+        for _, document in page:
+            for _, field in specs:
+                stored = document.get(field)
+                if not isinstance(stored, dict) or not isinstance(stored.get("reference"), str):
+                    continue
+                resolved = try_resolve_reference(self.store.connection, stored["reference"])
+                if resolved is not None:
+                    targets.add(resolved)
+        return self._load_include_documents(targets - primary_keys)
+
+    def _reverse_includes(
+        self,
+        primary_type: str,
+        page: list[tuple[str, dict[str, Any]]],
+        specs: list[tuple[str, str]],
+    ) -> list[dict[str, Any]]:
+        primary_keys = {(primary_type, resource_id) for resource_id, _ in page}
+        targets: set[tuple[str, str]] = set()
+        for referencing_type, field in specs:
+            rows = self.store.connection.execute(
+                "SELECT id, document FROM resources WHERE type = ? AND deleted = 0 ORDER BY id",
+                (referencing_type,),
+            ).fetchall()
+            for row in rows:
+                document = self.store.decode(row["document"])
+                stored = document.get(field)
+                if not isinstance(stored, dict) or not isinstance(stored.get("reference"), str):
+                    continue
+                resolved = try_resolve_reference(self.store.connection, stored["reference"])
+                if resolved is not None and resolved in primary_keys:
+                    targets.add((referencing_type, row["id"]))
+        return self._load_include_documents(targets - primary_keys)
 
     @staticmethod
     def _paging(parameters: dict[str, list[str]]) -> tuple[int | None, int]:
