@@ -80,6 +80,12 @@ def make_handler(service: FhirVault) -> type[BaseHTTPRequestHandler]:
 
         def _resource_routes(self, parts: list[str], query: dict[str, list[str]], key: str | None) -> Response:
             if not parts:
+                if self.command == "POST":
+                    try:
+                        bundle = self._body()
+                    except ValidationError as error:
+                        raise OperationOutcomeError(400, "invalid", str(error)) from error
+                    return 200, service.transaction(bundle, key), {}
                 raise NotFoundError("route was not found")
             resource_type = parts[0]
             if resource_type == "Subscription":

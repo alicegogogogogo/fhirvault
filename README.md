@@ -19,6 +19,8 @@ The initial release intentionally supports a compact public contract:
   reference, with deterministic ordering;
 - subscriptions match `created`, `updated`, and `deleted` changes and record an
   ordered delivery event each time;
+- `POST /fhir` applies a transaction Bundle atomically: every entry succeeds or
+  the whole batch rolls back;
 - repeated state-changing requests with the same `Idempotency-Key` return the
   first response.
 
@@ -172,6 +174,66 @@ Idempotency-Key: encounter-1-delete
 
 The delete is logical: the resource disappears from `GET` and from search (404
 afterwards), a tombstone version is appended, and `_history` stays readable.
+
+### Transaction bundle
+
+```http
+POST /fhir
+Idempotency-Key: txn-1
+Content-Type: application/json
+
+{
+  "resourceType": "Bundle",
+  "type": "transaction",
+  "entry": [
+    {"request": {"method": "POST", "url": "Patient"},
+     "resource": {"resourceType": "Patient", "id": "p-1", "gender": "female"}},
+    {"request": {"method": "PUT", "url": "Observation/o-1", "ifMatch": "W/\"1\""},
+     "resource": {"resourceType": "Observation", "id": "o-1", "status": "final", "code.text": "HbA1c"}},
+    {"request": {"method": "DELETE", "url": "Encounter/e-1"}}
+  ]
+}
+```
+
+`POST /fhir` applies a transaction Bundle atomically: the entries take effect in
+order, and the first failing entry aborts the batch — every earlier write is
+rolled back and only that first error is reported. The Bundle accepts exactly
+`resourceType` (`"Bundle"`), `type` (`"transaction"`), and `entry` (1–100
+items); each entry accepts exactly `request` and an optional `resource`, and
+each request accepts exactly `method`, `url`, and `ifMatch`. Anything else —
+malformed JSON, a wrong content type, extra fields, an unknown resource type,
+an out-of-range entry count, or a missing `Idempotency-Key` — fails the whole
+request with HTTP 400 and an `application/fhir+json` `OperationOutcome` whose
+`issue.code` is `invalid`, and changes nothing.
+
+Entry semantics mirror the standalone routes:
+
+- `POST` with `url` set to a resource type creates the body's id at version 1;
+  an id that already exists fails the batch with HTTP 409 `conflict`.
+- `PUT` with `url` set to `<resourceType>/<id>` keeps the upsert semantics of
+  the standalone route: the version increments, a deleted id is recreated, and
+  the body id must equal the path id. `ifMatch` accepts strong (`"1"`) and weak
+  (`W/"1"`) ETags and `*`; a missing `ifMatch` is unconditional, a malformed
+  one is HTTP 400 `invalid`, a missing or deleted target is HTTP 404
+  `not-found`, and a version mismatch is HTTP 412 `conflict`.
+- `DELETE` with `url` set to `<resourceType>/<id>` writes a tombstone; a
+  missing or already deleted target is HTTP 404 `not-found`. `DELETE` entries
+  carry no `resource`.
+
+Later entries may reference resources written by earlier entries, both by id
+(`Patient/p-1`) and by identifier (`Patient/identifier|<system>|<value>`); a
+reference that does not exist, is deleted, is ambiguous, or names a wrong type
+fails the batch with HTTP 400 `invalid`.
+
+A successful batch returns HTTP 200 with a `transaction-response` Bundle whose
+entries follow the request order. `POST` and `PUT` entries carry
+`response.status` `"201"`/`"200"`, `response.location`, `response.etag`, and
+the stored `resource`; `DELETE` entries carry `response.status` `"200"`,
+`response.location`, and `"resource": null`. Subscription events are recorded
+once per write, in entry order, when the batch commits. Replaying the same
+bundle with the same `Idempotency-Key` returns the first response without
+creating new versions or events; reusing the key for anything else is HTTP 409
+`conflict`.
 
 ### Version history
 
@@ -418,7 +480,8 @@ Failed conditional updates are reported instead as an `application/fhir+json`
 `OperationOutcome`: HTTP 400 with `issue.code` `invalid` for a malformed
 `If-Match`, HTTP 404 with `not-found` when the target resource does not
 exist, and HTTP 412 with `conflict` when the provided version is not the
-current version.
+current version. Every failure of `POST /fhir` is reported the same way, with
+`issue.code` `invalid`, `not-found`, or `conflict` as described above.
 
 ## Tests
 

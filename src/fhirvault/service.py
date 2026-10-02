@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 from typing import Any, Callable
 
 from .errors import ConflictError, NotFoundError, OperationOutcomeError, ValidationError
@@ -14,6 +15,8 @@ from .model import (
     parse_if_match,
     parse_resource,
     parse_subscription,
+    parse_transaction_entry,
+    parse_transaction_envelope,
     resolve_reference,
     search_match,
     validate_path_id,
@@ -161,24 +164,95 @@ class FhirVault:
 
         def apply() -> dict[str, Any]:
             row = self._require(resource_type, resource_id)
-            version = row["current_version"] + 1
-            moment = self.store.now()
-            document = self.store.decode(row["document"])
-            document["meta"] = {"versionId": str(version), "lastUpdated": moment}
-            connection = self.store.connection
-            connection.execute(
-                "UPDATE resources SET deleted = 1, current_version = ?, document = ?, last_updated = ? "
-                "WHERE type = ? AND id = ?",
-                (version, self.store.encode(document), moment, resource_type, resource_id),
-            )
-            connection.execute(
-                "INSERT INTO versions(type, id, version, document, recorded_at) VALUES (?, ?, ?, ?, ?)",
-                (resource_type, resource_id, version, self.store.encode(document), moment),
-            )
-            self._record_events(resource_type, resource_id, "deleted", version, document, moment)
-            return {"id": resource_id, "resourceType": resource_type, "deleted": True, "version": version, "lastUpdated": moment}
+            return self._tombstone(resource_type, resource_id, row)
 
         return self._idempotent(key, f"delete:{resource_type}/{resource_id}", apply)
+
+    def _tombstone(self, resource_type: str, resource_id: str, row: Any) -> dict[str, Any]:
+        version = row["current_version"] + 1
+        moment = self.store.now()
+        document = self.store.decode(row["document"])
+        document["meta"] = {"versionId": str(version), "lastUpdated": moment}
+        connection = self.store.connection
+        connection.execute(
+            "UPDATE resources SET deleted = 1, current_version = ?, document = ?, last_updated = ? "
+            "WHERE type = ? AND id = ?",
+            (version, self.store.encode(document), moment, resource_type, resource_id),
+        )
+        connection.execute(
+            "INSERT INTO versions(type, id, version, document, recorded_at) VALUES (?, ?, ?, ?, ?)",
+            (resource_type, resource_id, version, self.store.encode(document), moment),
+        )
+        self._record_events(resource_type, resource_id, "deleted", version, document, moment)
+        return {"id": resource_id, "resourceType": resource_type, "deleted": True, "version": version, "lastUpdated": moment}
+
+    # ------------------------------------------------------------------ transaction
+
+    @_serialized
+    def transaction(self, raw: Any, key: str | None = None) -> dict[str, Any]:
+        """Apply a transaction Bundle atomically, in entry order.
+
+        Every failure is reported as an OperationOutcome; the first failing
+        entry aborts the batch and the surrounding store transaction rolls
+        every earlier entry back. The idempotency key is scoped to the exact
+        bundle content, so a replay returns the first response while the same
+        key with a different bundle (or any other operation) conflicts.
+        """
+        if not key:
+            raise OperationOutcomeError(400, "invalid", "Idempotency-Key header is required")
+        entries = parse_transaction_envelope(raw)
+        digest = hashlib.sha256(self.store.encode(raw).encode("utf-8")).hexdigest()
+
+        def apply() -> dict[str, Any]:
+            return {
+                "resourceType": "Bundle",
+                "type": "transaction-response",
+                "entry": [self._apply_transaction_entry(item, index) for index, item in enumerate(entries)],
+            }
+
+        try:
+            return self._idempotent(key, f"transaction:{digest}", apply)
+        except ConflictError as error:
+            raise OperationOutcomeError(409, "conflict", str(error)) from error
+
+    def _apply_transaction_entry(self, raw: Any, index: int) -> dict[str, Any]:
+        entry = parse_transaction_entry(raw, index)
+        if entry.method == "DELETE":
+            assert entry.resource_id is not None
+            try:
+                row = self._require(entry.resource_type, entry.resource_id)
+            except NotFoundError as error:
+                raise OperationOutcomeError(404, "not-found", str(error)) from error
+            self._tombstone(entry.resource_type, entry.resource_id, row)
+            return {
+                "response": {
+                    "status": "200",
+                    "location": f"/fhir/{entry.resource_type}/{entry.resource_id}",
+                },
+                "resource": None,
+            }
+        try:
+            validated = parse_resource(entry.resource_type, entry.resource, expected_id=entry.resource_id)
+            self._assert_references(validated)
+        except (ValidationError, NotFoundError) as error:
+            raise OperationOutcomeError(400, "invalid", str(error)) from error
+        if entry.method == "POST":
+            try:
+                document = self._write(validated, reject_existing=True)
+            except ConflictError as error:
+                raise OperationOutcomeError(409, "conflict", str(error)) from error
+            status = "201"
+        else:
+            document = self._write(validated, reject_existing=False, if_match=entry.if_match)
+            status = "200"
+        return {
+            "response": {
+                "status": status,
+                "location": f"/fhir/{validated.resource_type}/{validated.resource_id}",
+                "etag": f'W/"{document["meta"]["versionId"]}"',
+            },
+            "resource": document,
+        }
 
     @_serialized
     def history(self, resource_type: str, resource_id: str) -> dict[str, Any]:

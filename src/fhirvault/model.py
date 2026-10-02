@@ -351,3 +351,87 @@ def criteria_match(criteria: dict[str, Any], resource_type: str, document: dict[
     if "equals" in criteria:
         return value == criteria["equals"]
     return isinstance(value, str) and value.startswith(criteria["prefix"])
+
+
+# ---------------------------------------------------------------------- transactions
+
+TRANSACTION_METHODS: tuple[str, ...] = ("POST", "PUT", "DELETE")
+TRANSACTION_ENTRY_LIMIT = 100
+
+
+def _invalid(diagnostics: str) -> OperationOutcomeError:
+    return OperationOutcomeError(400, "invalid", diagnostics)
+
+
+@dataclass(frozen=True)
+class TransactionEntry:
+    method: str
+    resource_type: str
+    resource_id: str | None
+    resource: Any
+    if_match: str | None
+
+
+def parse_transaction_envelope(raw: Any) -> list[Any]:
+    """Validate the transaction Bundle envelope and return its raw entries."""
+    if not isinstance(raw, dict):
+        raise _invalid("transaction body must be a JSON object")
+    unknown = set(raw) - {"resourceType", "type", "entry"}
+    if unknown:
+        raise _invalid(f"Bundle has unknown fields: {', '.join(sorted(unknown))}")
+    if raw.get("resourceType") != "Bundle":
+        raise _invalid("resourceType must be Bundle")
+    if raw.get("type") != "transaction":
+        raise _invalid("Bundle.type must be transaction")
+    entries = raw.get("entry")
+    if not isinstance(entries, list) or not 1 <= len(entries) <= TRANSACTION_ENTRY_LIMIT:
+        raise _invalid(f"Bundle.entry must be an array of 1 to {TRANSACTION_ENTRY_LIMIT} entries")
+    return entries
+
+
+def parse_transaction_entry(raw: Any, index: int) -> TransactionEntry:
+    """Validate one transaction entry's request shape; the resource itself is
+    validated later, in entry order, so references can point at earlier writes."""
+    where = f"entry[{index}]"
+    if not isinstance(raw, dict):
+        raise _invalid(f"{where} must be an object")
+    unknown = set(raw) - {"request", "resource"}
+    if unknown:
+        raise _invalid(f"{where} has unknown fields: {', '.join(sorted(unknown))}")
+    request = raw.get("request")
+    if not isinstance(request, dict):
+        raise _invalid(f"{where}.request must be an object")
+    unknown = set(request) - {"method", "url", "ifMatch"}
+    if unknown:
+        raise _invalid(f"{where}.request has unknown fields: {', '.join(sorted(unknown))}")
+    method = request.get("method")
+    if method not in TRANSACTION_METHODS:
+        raise _invalid(f"{where}.request.method must be one of: {', '.join(TRANSACTION_METHODS)}")
+    url = request.get("url")
+    if not isinstance(url, str) or not url:
+        raise _invalid(f"{where}.request.url must be a non-empty string")
+    resource_id: str | None = None
+    if method == "POST":
+        if url not in RESOURCE_TYPES:
+            raise _invalid(f"{where}.request.url must be a resource type, one of: {', '.join(RESOURCE_TYPES)}")
+        resource_type = url
+    else:
+        resource_type, separator, resource_id = url.partition("/")
+        if separator != "/" or resource_type not in RESOURCE_TYPES or not _ID_PATTERN.match(resource_id):
+            raise _invalid(
+                f"{where}.request.url must be <resourceType>/<id> with a resource type of: {', '.join(RESOURCE_TYPES)}"
+            )
+    if "ifMatch" in request and method != "PUT":
+        raise _invalid(f"{where}.request.ifMatch is only supported for PUT")
+    if_match: str | None = None
+    if method == "PUT" and "ifMatch" in request:
+        if not isinstance(request["ifMatch"], str):
+            raise _invalid(f"{where}.request.ifMatch must be a string")
+        if_match = parse_if_match(request["ifMatch"])
+    resource = raw.get("resource")
+    if method == "DELETE":
+        if "resource" in raw:
+            raise _invalid(f"{where} must not contain a resource for DELETE")
+    elif "resource" not in raw:
+        raise _invalid(f"{where}.resource is required for {method}")
+    return TransactionEntry(method, resource_type, resource_id, resource, if_match)

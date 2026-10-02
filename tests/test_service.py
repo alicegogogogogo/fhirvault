@@ -850,5 +850,283 @@ class ConditionalUpdateHttpTests(unittest.TestCase):
         self.assertEqual([1, 2], [entry["version"] for entry in history["entries"]])
 
 
+def transaction_bundle(*entries: dict) -> dict:
+    return {"resourceType": "Bundle", "type": "transaction", "entry": list(entries)}
+
+
+def txn_entry(method: str, url: str, resource: dict | None = None, if_match: str | None = None) -> dict:
+    request: dict[str, Any] = {"method": method, "url": url}
+    if if_match is not None:
+        request["ifMatch"] = if_match
+    result: dict[str, Any] = {"request": request}
+    if resource is not None:
+        result["resource"] = resource
+    return result
+
+
+class TransactionHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = FhirVault(str(Path(self.directory.name) / "vault.db"), FrozenClock())
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.service))
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        self.directory.cleanup()
+
+    def request(self, method: str, path: str, payload: dict | None = None, headers: dict | None = None) -> tuple[int, dict, dict]:
+        return http_request(self.port, method, path, payload, headers)
+
+    def post_bundle(self, bundle: dict, key: str = "txn-1") -> tuple[int, dict, dict]:
+        return self.request("POST", "/fhir", bundle, {"Idempotency-Key": key})
+
+    def post_raw(self, data: bytes, headers: dict) -> tuple[int, dict, dict]:
+        request = Request(f"http://127.0.0.1:{self.port}/fhir", data=data, headers=headers, method="POST")
+        try:
+            with _OPENER.open(request, timeout=5) as response:
+                headers_out = {name.lower(): value for name, value in response.headers.items()}
+                return response.status, headers_out, json.loads(response.read() or b"null")
+        except HTTPError as error:
+            headers_out = {name.lower(): value for name, value in error.headers.items()}
+            return error.code, headers_out, json.loads(error.read() or b"null")
+
+    def assert_outcome(self, status: int, headers: dict, body: dict, expected_status: int, code: str):
+        self.assertEqual(expected_status, status)
+        self.assertEqual("application/fhir+json", headers.get("content-type"))
+        self.assertEqual("OperationOutcome", body["resourceType"])
+        self.assertEqual(1, len(body["issue"]))
+        self.assertEqual("error", body["issue"][0]["severity"])
+        self.assertEqual(code, body["issue"][0]["code"])
+
+    # ---------------------------------------------------------------- happy path
+
+    def test_transaction_applies_entries_in_order(self):
+        status, _, body = self.post_bundle(transaction_bundle(
+            txn_entry("POST", "Patient", patient("p-10")),
+            txn_entry("POST", "Observation", observation("o-10", subject="Patient/p-10")),
+            txn_entry("PUT", "Observation/o-10", observation("o-10", subject="Patient/p-10", value=8.1), if_match='W/"1"'),
+            txn_entry("DELETE", "Observation/o-10"),
+        ))
+        self.assertEqual(200, status)
+        self.assertEqual("Bundle", body["resourceType"])
+        self.assertEqual("transaction-response", body["type"])
+        self.assertEqual(4, len(body["entry"]))
+        self.assertEqual(["201", "201", "200", "200"], [item["response"]["status"] for item in body["entry"]])
+        self.assertEqual("/fhir/Patient/p-10", body["entry"][0]["response"]["location"])
+        self.assertEqual('W/"1"', body["entry"][0]["response"]["etag"])
+        self.assertEqual("p-10", body["entry"][0]["resource"]["id"])
+        self.assertEqual('W/"2"', body["entry"][2]["response"]["etag"])
+        self.assertEqual(8.1, body["entry"][2]["resource"]["value"])
+        self.assertEqual("/fhir/Observation/o-10", body["entry"][3]["response"]["location"])
+        self.assertNotIn("etag", body["entry"][3]["response"])
+        self.assertIsNone(body["entry"][3]["resource"])
+
+        self.assertEqual(200, self.request("GET", "/fhir/Patient/p-10")[0])
+        self.assertEqual(404, self.request("GET", "/fhir/Observation/o-10")[0])
+        _, _, history = self.request("GET", "/fhir/Observation/o-10/_history")
+        self.assertEqual([1, 2, 3], [item["version"] for item in history["entries"]])
+        self.assertTrue(history["entries"][-1]["tombstone"])
+
+    def test_later_entries_may_reference_earlier_writes_by_identifier(self):
+        status, _, body = self.post_bundle(transaction_bundle(
+            txn_entry("POST", "Patient", patient("p-11", identifier=[{"system": "mrn", "value": "B222"}])),
+            txn_entry("POST", "Encounter", encounter("e-11", subject="Patient/identifier|mrn|B222")),
+        ))
+        self.assertEqual(200, status)
+        self.assertEqual(["201", "201"], [item["response"]["status"] for item in body["entry"]])
+        _, _, stored = self.request("GET", "/fhir/Encounter/e-11")
+        self.assertEqual("Patient/identifier|mrn|B222", stored["subject"]["reference"])
+
+    def test_events_are_recorded_in_order_without_duplicates(self):
+        self.request("POST", "/Subscription", {"id": "sub-t", "criteria": {"type": "Patient"}}, {"Idempotency-Key": "sub-t"})
+        status, _, _ = self.post_bundle(transaction_bundle(
+            txn_entry("POST", "Patient", patient("p-12")),
+            txn_entry("PUT", "Patient/p-12", patient("p-12", gender="female")),
+        ))
+        self.assertEqual(200, status)
+        _, _, events = self.request("GET", "/subscriptions/sub-t/events")
+        self.assertEqual([1, 2], [event["sequence"] for event in events["events"]])
+        self.assertEqual(["created", "updated"], [event["event"] for event in events["events"]])
+        self.assertEqual([1, 2], [event["version"] for event in events["events"]])
+
+    # ---------------------------------------------------------------- envelope validation
+
+    def test_missing_idempotency_key_is_a_fhir_400(self):
+        status, headers, body = self.request("POST", "/fhir", transaction_bundle(txn_entry("POST", "Patient", patient("p-20"))))
+        self.assert_outcome(status, headers, body, 400, "invalid")
+        self.assertEqual(404, self.request("GET", "/fhir/Patient/p-20")[0])
+
+    def test_invalid_json_is_a_fhir_400(self):
+        status, headers, body = self.post_raw(b"{not json", {"Content-Type": "application/json", "Idempotency-Key": "bad-json"})
+        self.assert_outcome(status, headers, body, 400, "invalid")
+
+    def test_wrong_content_type_is_a_fhir_400(self):
+        status, headers, body = self.post_raw(b"{}", {"Content-Type": "text/plain", "Idempotency-Key": "bad-ct"})
+        self.assert_outcome(status, headers, body, 400, "invalid")
+
+    def test_envelope_validation(self):
+        too_many = [{"request": {"method": "DELETE", "url": f"Patient/p-{index}"}} for index in range(101)]
+        invalid_bundles = [
+            {},
+            {"resourceType": "Patient", "type": "transaction", "entry": [txn_entry("DELETE", "Patient/p-1")]},
+            {"resourceType": "Bundle", "type": "batch", "entry": [txn_entry("DELETE", "Patient/p-1")]},
+            {"resourceType": "Bundle", "type": "transaction", "entry": [txn_entry("DELETE", "Patient/p-1")], "extra": 1},
+            {"resourceType": "Bundle", "type": "transaction"},
+            {"resourceType": "Bundle", "type": "transaction", "entry": []},
+            {"resourceType": "Bundle", "type": "transaction", "entry": too_many},
+            {"resourceType": "Bundle", "type": "transaction", "entry": ["not-an-object"]},
+            {"resourceType": "Bundle", "type": "transaction", "entry": [{"request": {"method": "DELETE", "url": "Patient/p-1"}, "fullUrl": "x"}]},
+            {"resourceType": "Bundle", "type": "transaction", "entry": [{"resource": patient("p-1")}]},
+            {"resourceType": "Bundle", "type": "transaction", "entry": [{"request": {"method": "DELETE", "url": "Patient/p-1", "ifNoneMatch": "*"}}]},
+        ]
+        for index, bundle in enumerate(invalid_bundles):
+            with self.subTest(index=index):
+                status, headers, body = self.post_bundle(bundle, key=f"bad-envelope-{index}")
+                self.assert_outcome(status, headers, body, 400, "invalid")
+        _, _, search = self.request("GET", "/fhir/Patient")
+        self.assertEqual(0, search["total"])
+
+    def test_entry_request_validation(self):
+        invalid_entries = [
+            txn_entry("GET", "Patient/p-1"),
+            txn_entry("PATCH", "Patient/p-1"),
+            txn_entry("POST", "Patient/p-1", patient("p-1")),
+            txn_entry("POST", "Bogus", patient("p-1")),
+            txn_entry("PUT", "Patient", patient("p-1")),
+            txn_entry("PUT", "Bogus/p-1", patient("p-1")),
+            txn_entry("DELETE", "Patient/"),
+            txn_entry("POST", "Patient"),  # resource required
+            txn_entry("PUT", "Patient/p-1"),  # resource required
+            txn_entry("POST", "Patient", patient("p-1"), if_match='W/"1"'),  # ifMatch is PUT-only
+            {**txn_entry("DELETE", "Patient/p-1"), "resource": patient("p-1")},
+            txn_entry("POST", "Patient", patient("p-1", telecom="555")),
+            txn_entry("POST", "Patient", {**patient("p-1"), "resourceType": "Observation"}),
+            txn_entry("PUT", "Patient/p-1", patient("p-2")),  # body id must match path id
+            txn_entry("PUT", "Patient/p-1", patient("p-1"), if_match="junk"),
+        ]
+        for index, bad in enumerate(invalid_entries):
+            with self.subTest(index=index):
+                status, headers, body = self.post_bundle(transaction_bundle(bad), key=f"bad-entry-{index}")
+                self.assert_outcome(status, headers, body, 400, "invalid")
+        _, _, search = self.request("GET", "/fhir/Patient")
+        self.assertEqual(0, search["total"])
+
+    # ---------------------------------------------------------------- atomicity
+
+    def test_first_failure_rolls_back_the_whole_batch(self):
+        status, headers, body = self.post_bundle(transaction_bundle(
+            txn_entry("POST", "Patient", patient("p-13")),
+            txn_entry("POST", "Observation", observation("o-13", subject="Patient/p-404")),
+            txn_entry("POST", "Observation", observation("o-14", subject="Patient/p-13")),
+        ))
+        self.assert_outcome(status, headers, body, 400, "invalid")
+        self.assertIn("Patient/p-404", body["issue"][0]["diagnostics"])
+        self.assertEqual(404, self.request("GET", "/fhir/Patient/p-13")[0])
+        _, _, search = self.request("GET", "/fhir/Observation")
+        self.assertEqual(0, search["total"])
+
+    def test_reference_to_resource_deleted_earlier_in_the_batch_fails(self):
+        self.request("POST", "/fhir/Patient", patient("p-17"), {"Idempotency-Key": "seed"})
+        status, headers, body = self.post_bundle(transaction_bundle(
+            txn_entry("DELETE", "Patient/p-17"),
+            txn_entry("POST", "Observation", observation("o-17", subject="Patient/p-17")),
+        ))
+        self.assert_outcome(status, headers, body, 400, "invalid")
+        self.assertEqual(200, self.request("GET", "/fhir/Patient/p-17")[0])
+
+    def test_post_of_existing_id_conflicts_and_rolls_back(self):
+        self.request("POST", "/fhir/Patient", patient("p-1"), {"Idempotency-Key": "seed"})
+        status, headers, body = self.post_bundle(transaction_bundle(
+            txn_entry("POST", "Patient", patient("p-14")),
+            txn_entry("POST", "Patient", patient("p-1")),
+        ))
+        self.assert_outcome(status, headers, body, 409, "conflict")
+        self.assertEqual(404, self.request("GET", "/fhir/Patient/p-14")[0])
+        _, _, current = self.request("GET", "/fhir/Patient/p-1")
+        self.assertEqual("1", current["meta"]["versionId"])
+
+    # ---------------------------------------------------------------- conditional writes
+
+    def test_put_if_match_semantics_inside_a_transaction(self):
+        self.request("POST", "/fhir/Patient", patient("p-1"), {"Idempotency-Key": "seed"})
+
+        status, headers, body = self.post_bundle(
+            transaction_bundle(txn_entry("PUT", "Patient/p-1", patient("p-1", gender="female"), if_match='W/"2"')), "txn-stale"
+        )
+        self.assert_outcome(status, headers, body, 412, "conflict")
+
+        status, headers, body = self.post_bundle(
+            transaction_bundle(txn_entry("PUT", "Patient/p-404", patient("p-404"), if_match="*")), "txn-missing"
+        )
+        self.assert_outcome(status, headers, body, 404, "not-found")
+
+        _, _, current = self.request("GET", "/fhir/Patient/p-1")
+        self.assertEqual("1", current["meta"]["versionId"])
+
+        for index, tag in enumerate(('"1"', 'W/"2"', "*")):
+            status, _, body = self.post_bundle(
+                transaction_bundle(txn_entry("PUT", "Patient/p-1", patient("p-1", gender="female"), if_match=tag)),
+                f"txn-tag-{index}",
+            )
+            self.assertEqual(200, status)
+            self.assertEqual("200", body["entry"][0]["response"]["status"])
+        _, _, current = self.request("GET", "/fhir/Patient/p-1")
+        self.assertEqual("4", current["meta"]["versionId"])
+
+    def test_unconditional_put_upserts_and_recreates_deleted_ids(self):
+        status, _, body = self.post_bundle(transaction_bundle(
+            txn_entry("PUT", "Patient/p-15", patient("p-15")),
+        ))
+        self.assertEqual(200, status)
+        self.assertEqual('W/"1"', body["entry"][0]["response"]["etag"])
+
+        self.request("DELETE", "/fhir/Patient/p-15", None, {"Idempotency-Key": "del"})
+        status, _, body = self.post_bundle(transaction_bundle(
+            txn_entry("PUT", "Patient/p-15", patient("p-15", gender="female")),
+        ), key="txn-recreate")
+        self.assertEqual(200, status)
+        self.assertEqual('W/"3"', body["entry"][0]["response"]["etag"])
+        _, _, history = self.request("GET", "/fhir/Patient/p-15/_history")
+        self.assertEqual([1, 2, 3], [item["version"] for item in history["entries"]])
+
+    def test_delete_of_missing_id_is_not_found(self):
+        status, headers, body = self.post_bundle(transaction_bundle(txn_entry("DELETE", "Patient/p-404")))
+        self.assert_outcome(status, headers, body, 404, "not-found")
+
+    # ---------------------------------------------------------------- idempotency
+
+    def test_same_key_replays_the_first_response_without_duplicates(self):
+        self.request("POST", "/Subscription", {"id": "sub-r", "criteria": {"type": "Patient"}}, {"Idempotency-Key": "sub-r"})
+        bundle = transaction_bundle(txn_entry("POST", "Patient", patient("p-16")))
+        first = self.post_bundle(bundle, key="txn-replay")
+        replay = self.post_bundle(bundle, key="txn-replay")
+        self.assertEqual(200, first[0])
+        self.assertEqual(first, replay)
+        _, _, history = self.request("GET", "/fhir/Patient/p-16/_history")
+        self.assertEqual([1], [item["version"] for item in history["entries"]])
+        _, _, events = self.request("GET", "/subscriptions/sub-r/events")
+        self.assertEqual(1, events["total"])
+
+    def test_same_key_with_a_different_bundle_conflicts(self):
+        self.post_bundle(transaction_bundle(txn_entry("POST", "Patient", patient("p-18"))), key="txn-shared")
+        status, headers, body = self.post_bundle(
+            transaction_bundle(txn_entry("POST", "Patient", patient("p-19"))), key="txn-shared"
+        )
+        self.assert_outcome(status, headers, body, 409, "conflict")
+        self.assertEqual(404, self.request("GET", "/fhir/Patient/p-19")[0])
+
+    def test_key_reused_from_another_operation_conflicts(self):
+        self.request("POST", "/fhir/Patient", patient("p-21"), {"Idempotency-Key": "plain-create"})
+        status, headers, body = self.post_bundle(
+            transaction_bundle(txn_entry("POST", "Patient", patient("p-22"))), key="plain-create"
+        )
+        self.assert_outcome(status, headers, body, 409, "conflict")
+
+
 if __name__ == "__main__":
     unittest.main()
