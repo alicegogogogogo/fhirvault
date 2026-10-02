@@ -5,11 +5,15 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
-from fhirvault.errors import ConflictError, NotFoundError, ValidationError
+# Talk to the loopback server directly, never through a proxy from the environment.
+_OPENER = build_opener(ProxyHandler({}))
+
+from fhirvault.errors import ConflictError, NotFoundError, OperationOutcomeError, ValidationError
 from fhirvault.server import make_handler
 from fhirvault.service import FhirVault
 
@@ -73,6 +77,28 @@ def encounter(encounter_id: str = "e-1", subject: str = "Patient/p-1", **overrid
     return document
 
 
+def http_request(
+    port: int,
+    method: str,
+    path: str,
+    payload: dict | None = None,
+    headers: dict | None = None,
+) -> tuple[int, dict, dict]:
+    request_headers = dict(headers or {})
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode()
+        request_headers["Content-Type"] = "application/json"
+    request = Request(f"http://127.0.0.1:{port}{path}", data=data, headers=request_headers, method=method)
+    try:
+        with _OPENER.open(request, timeout=5) as response:
+            headers_out = {name.lower(): value for name, value in response.headers.items()}
+            return response.status, headers_out, json.loads(response.read() or b"null")
+    except HTTPError as error:
+        headers_out = {name.lower(): value for name, value in error.headers.items()}
+        return error.code, headers_out, json.loads(error.read() or b"null")
+
+
 class FhirVaultTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -93,17 +119,8 @@ class FhirVaultTests(unittest.TestCase):
         headers: dict | None = None,
     ) -> tuple[int, dict]:
         assert self.port is not None, "start the HTTP server before issuing requests"
-        request_headers = dict(headers or {})
-        data = None
-        if payload is not None:
-            data = json.dumps(payload).encode()
-            request_headers["Content-Type"] = "application/json"
-        request = Request(f"http://127.0.0.1:{self.port}{path}", data=data, headers=request_headers, method=method)
-        try:
-            with urlopen(request, timeout=5) as response:
-                return response.status, json.loads(response.read() or b"null")
-        except HTTPError as error:
-            return error.code, json.loads(error.read() or b"null")
+        status, _, body = http_request(self.port, method, path, payload, headers)
+        return status, body
 
     # ---------------------------------------------------------------- create/read
 
@@ -319,6 +336,88 @@ class FhirVaultTests(unittest.TestCase):
         with self.assertRaises(NotFoundError):
             self.service.events("sub-404")
 
+    # ---------------------------------------------------------------- conditional update
+
+    def test_update_with_matching_if_match_creates_next_version(self):
+        self.service.create("Observation", observation(), "k40")
+        updated = self.service.update("Observation", "o-1", observation(value=8.0), "k41", if_match='W/"1"')
+        self.assertEqual("2", updated["meta"]["versionId"])
+        self.assertEqual(8.0, updated["value"])
+
+    def test_strong_and_weak_if_match_are_equivalent(self):
+        self.service.create("Observation", observation(), "k42")
+        self.assertEqual("2", self.service.update("Observation", "o-1", observation(value=1.0), "k43", if_match='"1"')["meta"]["versionId"])
+        self.assertEqual("3", self.service.update("Observation", "o-1", observation(value=2.0), "k44", if_match='W/"2"')["meta"]["versionId"])
+
+    def test_star_if_match_requires_an_existing_resource(self):
+        self.service.create("Observation", observation(), "k45")
+        updated = self.service.update("Observation", "o-1", observation(value=3.0), "k46", if_match="*")
+        self.assertEqual("2", updated["meta"]["versionId"])
+        with self.assertRaises(OperationOutcomeError) as caught:
+            self.service.update("Observation", "o-404", observation("o-404"), "k47", if_match="*")
+        self.assertEqual(404, caught.exception.status)
+        self.assertEqual("not-found", caught.exception.issue_code)
+
+    def test_if_match_on_missing_resource_is_not_found(self):
+        with self.assertRaises(OperationOutcomeError) as caught:
+            self.service.update("Observation", "o-404", observation("o-404"), "k48", if_match='"1"')
+        self.assertEqual(404, caught.exception.status)
+        self.assertEqual("not-found", caught.exception.issue_code)
+
+    def test_stale_if_match_conflicts_and_keeps_history(self):
+        self.service.create("Observation", observation(), "k49")
+        self.service.update("Observation", "o-1", observation(value=7.4), "k50")
+        with self.assertRaises(OperationOutcomeError) as caught:
+            self.service.update("Observation", "o-1", observation(value=9.9), "k51", if_match='"1"')
+        self.assertEqual(412, caught.exception.status)
+        self.assertEqual("conflict", caught.exception.issue_code)
+        self.assertIn("not the current version", str(caught.exception))
+        history = self.service.history("Observation", "o-1")
+        self.assertEqual([1, 2], [entry["version"] for entry in history["entries"]])
+        self.assertEqual(7.4, self.service.read("Observation", "o-1")["value"])
+
+    def test_invalid_if_match_is_rejected_without_touching_the_resource(self):
+        self.service.create("Observation", observation(), "k52")
+        for bad in ("bogus", "W/1", '"unclosed', 'W/"1" "1"', ""):
+            with self.assertRaises(OperationOutcomeError) as caught:
+                self.service.update("Observation", "o-1", observation(value=5.0), f"k-bad-{bad}", if_match=bad)
+            self.assertEqual(400, caught.exception.status, bad)
+            self.assertEqual("invalid", caught.exception.issue_code, bad)
+        self.assertEqual("1", self.service.read("Observation", "o-1")["meta"]["versionId"])
+
+    def test_missing_if_match_keeps_unconditional_upsert(self):
+        created = self.service.update("Observation", "o-new", observation("o-new"), "k53")
+        self.assertEqual("1", created["meta"]["versionId"])
+        overwritten = self.service.update("Observation", "o-new", observation("o-new", value=4.0), "k54")
+        self.assertEqual("2", overwritten["meta"]["versionId"])
+
+    def test_validation_failure_with_if_match_creates_no_version(self):
+        self.service.create("Observation", observation(), "k55")
+        with self.assertRaisesRegex(ValidationError, "must be one of"):
+            self.service.update("Observation", "o-1", observation(status="done"), "k56", if_match='"1"')
+        self.assertEqual([1], [entry["version"] for entry in self.service.history("Observation", "o-1")["entries"]])
+
+    def test_concurrent_conditional_updates_have_one_winner(self):
+        self.service.create("Observation", observation(), "k57")
+        barrier = threading.Barrier(2)
+        outcomes: list[tuple[str, Any]] = []
+
+        def attempt(key: str) -> None:
+            barrier.wait(timeout=5)
+            try:
+                document = self.service.update("Observation", "o-1", observation(value=8.8), key, if_match='W/"1"')
+                outcomes.append(("updated", document["meta"]["versionId"]))
+            except OperationOutcomeError as error:
+                outcomes.append(("error", error.status))
+
+        threads = [threading.Thread(target=attempt, args=(f"race-{index}",)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertEqual(sorted([("error", 412), ("updated", "2")]), sorted(outcomes))
+        self.assertEqual([1, 2], [entry["version"] for entry in self.service.history("Observation", "o-1")["entries"]])
+
     # ---------------------------------------------------------------- http surface
 
     def test_http_end_to_end(self):
@@ -387,6 +486,143 @@ class FhirVaultTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+
+class ConditionalUpdateHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = FhirVault(str(Path(self.directory.name) / "vault.db"), FrozenClock())
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.service))
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        self.directory.cleanup()
+
+    def request(self, method: str, path: str, payload: dict | None = None, headers: dict | None = None) -> tuple[int, dict, dict]:
+        return http_request(self.port, method, path, payload, headers)
+
+    def create_patient(self, patient_id: str = "p-1") -> tuple[int, dict, dict]:
+        return self.request("POST", "/fhir/Patient", patient(patient_id), {"Idempotency-Key": f"create-{patient_id}"})
+
+    def test_read_and_write_responses_carry_etags(self):
+        status, headers, body = self.create_patient()
+        self.assertEqual(201, status)
+        self.assertEqual('W/"1"', headers.get("etag"))
+        self.assertEqual("/fhir/Patient/p-1", headers.get("location"))
+
+        status, headers, body = self.request("GET", "/fhir/Patient/p-1")
+        self.assertEqual(200, status)
+        self.assertEqual('W/"1"', headers.get("etag"))
+
+        status, headers, body = self.request(
+            "PUT", "/fhir/Patient/p-1", patient(gender="female"),
+            {"Idempotency-Key": "u1", "If-Match": headers["etag"]},
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("2", body["meta"]["versionId"])
+        self.assertEqual('W/"2"', headers.get("etag"))
+        self.assertEqual("/fhir/Patient/p-1", headers.get("location"))
+
+        status, headers, body = self.request("GET", "/fhir/Patient/p-1")
+        self.assertEqual('W/"2"', headers.get("etag"))
+
+    def test_strong_and_weak_if_match_both_match(self):
+        self.create_patient()
+        status, _, body = self.request(
+            "PUT", "/fhir/Patient/p-1", patient(gender="female"), {"Idempotency-Key": "u2", "If-Match": '"1"'}
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("2", body["meta"]["versionId"])
+        status, _, body = self.request(
+            "PUT", "/fhir/Patient/p-1", patient(gender="male"), {"Idempotency-Key": "u3", "If-Match": 'W/"2"'}
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("3", body["meta"]["versionId"])
+
+    def test_star_if_match(self):
+        self.create_patient()
+        status, _, _ = self.request(
+            "PUT", "/fhir/Patient/p-1", patient(gender="female"), {"Idempotency-Key": "u4", "If-Match": "*"}
+        )
+        self.assertEqual(200, status)
+        status, headers, body = self.request(
+            "PUT", "/fhir/Patient/p-404", patient("p-404"), {"Idempotency-Key": "u5", "If-Match": "*"}
+        )
+        self.assertEqual(404, status)
+        self.assertEqual("application/fhir+json", headers.get("content-type"))
+        self.assertEqual("OperationOutcome", body["resourceType"])
+        self.assertEqual("not-found", body["issue"][0]["code"])
+
+    def test_invalid_if_match_is_a_fhir_400(self):
+        self.create_patient()
+        status, headers, body = self.request(
+            "PUT", "/fhir/Patient/p-1", patient(gender="female"), {"Idempotency-Key": "u6", "If-Match": "not-an-etag"}
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("application/fhir+json", headers.get("content-type"))
+        self.assertEqual("OperationOutcome", body["resourceType"])
+        self.assertEqual("invalid", body["issue"][0]["code"])
+        _, _, current = self.request("GET", "/fhir/Patient/p-1")
+        self.assertEqual("1", current["meta"]["versionId"])
+
+    def test_stale_if_match_is_a_fhir_412(self):
+        self.create_patient()
+        self.request("PUT", "/fhir/Patient/p-1", patient(gender="female"), {"Idempotency-Key": "u7"})
+        status, headers, body = self.request(
+            "PUT", "/fhir/Patient/p-1", patient(gender="male"), {"Idempotency-Key": "u8", "If-Match": 'W/"1"'}
+        )
+        self.assertEqual(412, status)
+        self.assertEqual("application/fhir+json", headers.get("content-type"))
+        self.assertEqual("OperationOutcome", body["resourceType"])
+        self.assertEqual("conflict", body["issue"][0]["code"])
+        self.assertIn("not the current version", body["issue"][0]["diagnostics"])
+        _, _, history = self.request("GET", "/fhir/Patient/p-1/_history")
+        self.assertEqual([1, 2], [entry["version"] for entry in history["entries"]])
+        _, _, current = self.request("GET", "/fhir/Patient/p-1")
+        self.assertEqual("female", current["gender"])
+
+    def test_missing_if_match_keeps_unconditional_update(self):
+        self.create_patient()
+        status, headers, body = self.request(
+            "PUT", "/fhir/Patient/p-1", patient(gender="female"), {"Idempotency-Key": "u9"}
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("2", body["meta"]["versionId"])
+        self.assertEqual('W/"2"', headers.get("etag"))
+
+    def test_concurrent_updates_with_same_if_match_have_one_winner(self):
+        self.create_patient()
+        barrier = threading.Barrier(2)
+        results: list[tuple[int, dict]] = []
+
+        def attempt(key: str) -> None:
+            barrier.wait(timeout=5)
+            status, _, body = self.request(
+                "PUT", "/fhir/Patient/p-1", patient(gender="female"),
+                {"Idempotency-Key": key, "If-Match": 'W/"1"'},
+            )
+            results.append((status, body))
+
+        threads = [threading.Thread(target=attempt, args=(f"race-{index}",)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        statuses = sorted(status for status, _ in results)
+        self.assertEqual([200, 412], statuses)
+        winner = next(body for status, body in results if status == 200)
+        self.assertEqual("2", winner["meta"]["versionId"])
+        loser = next(body for status, body in results if status == 412)
+        self.assertEqual("OperationOutcome", loser["resourceType"])
+        self.assertEqual("conflict", loser["issue"][0]["code"])
+        _, _, history = self.request("GET", "/fhir/Patient/p-1/_history")
+        self.assertEqual([1, 2], [entry["version"] for entry in history["entries"]])
 
 
 if __name__ == "__main__":

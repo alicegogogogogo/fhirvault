@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,11 @@ class Store:
         self.connection = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode = WAL")
+        # Serializes database access across handler threads: the service holds
+        # this lock for each public operation, so a check-then-write (e.g. an
+        # If-Match comparison) is atomic and concurrent updates resolve in a
+        # deterministic order.
+        self.lock = threading.RLock()
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS resources (
@@ -59,14 +65,15 @@ class Store:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        self.connection.execute("BEGIN IMMEDIATE")
-        try:
-            yield self.connection
-        except Exception:
-            self.connection.execute("ROLLBACK")
-            raise
-        else:
-            self.connection.execute("COMMIT")
+        with self.lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield self.connection
+            except Exception:
+                self.connection.execute("ROLLBACK")
+                raise
+            else:
+                self.connection.execute("COMMIT")
 
     @staticmethod
     def encode(value: Any) -> str:

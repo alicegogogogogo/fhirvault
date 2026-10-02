@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
-from .errors import NotFoundError, ValidationError
+from .errors import NotFoundError, OperationOutcomeError, ValidationError
 
 RESOURCE_TYPES: tuple[str, ...] = ("Patient", "Observation", "Encounter")
 SUBSCRIPTION_TYPE = "Subscription"
@@ -14,6 +14,7 @@ SUBSCRIPTION_TYPE = "Subscription"
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _INSTANT_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$")
+_IF_MATCH_PATTERN = re.compile(r'^(?:W/)?"([^"]*)"$')
 
 # Every storable field: name -> (required, kind, prefix searchable).
 _FIELDS: dict[str, dict[str, tuple[bool, str, bool]]] = {
@@ -90,6 +91,25 @@ def _identifier(value: Any, where: str) -> str:
 
 def validate_path_id(resource_id: str) -> str:
     return _identifier(resource_id, "resource id")
+
+
+def parse_if_match(value: str | None) -> str | None:
+    """Normalize an If-Match header to a version id, ``*``, or None when absent.
+
+    Strong (``"1"``) and weak (``W/"1"``) ETags both reduce to their version
+    identifier; anything that is not a single entity-tag or ``*`` is a 400.
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    if text == "*":
+        return "*"
+    match = _IF_MATCH_PATTERN.match(text)
+    if match is None:
+        raise OperationOutcomeError(
+            400, "invalid", 'If-Match must be *, "<versionId>", or W/"<versionId>"'
+        )
+    return match.group(1)
 
 
 def _instant(value: Any, where: str) -> str:

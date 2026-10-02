@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import functools
 from typing import Any, Callable
 
-from .errors import ConflictError, NotFoundError, ValidationError
+from .errors import ConflictError, NotFoundError, OperationOutcomeError, ValidationError
 from .model import (
     RESOURCE_TYPES,
     ValidatedResource,
     criteria_match,
     fields_for,
     identifiers_of,
+    parse_if_match,
     parse_resource,
     parse_subscription,
     resolve_reference,
@@ -20,6 +22,18 @@ from .store import Store
 _CONTROL_PARAMETERS = ("_count", "_offset", "_sort")
 
 
+def _serialized(method: Callable) -> Callable:
+    """Run a public operation under the store lock so the shared SQLite
+    connection is never used concurrently and writes stay deterministic."""
+
+    @functools.wraps(method)
+    def wrapper(self: "FhirVault", *args: Any, **kwargs: Any) -> Any:
+        with self.store.lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class FhirVault:
     def __init__(self, database: str, clock: Callable[[], Any] | None = None):
         self.store = Store(database, clock)
@@ -29,14 +43,14 @@ class FhirVault:
     def _idempotent(self, key: str | None, operation: str, action: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         if not key:
             raise ValidationError("Idempotency-Key header is required")
-        existing = self.store.connection.execute(
-            "SELECT operation, response FROM idempotency WHERE key = ?", (key,)
-        ).fetchone()
-        if existing:
-            if existing["operation"] != operation:
-                raise ConflictError("idempotency key was already used for another operation")
-            return self.store.decode(existing["response"])
         with self.store.transaction():
+            existing = self.store.connection.execute(
+                "SELECT operation, response FROM idempotency WHERE key = ?", (key,)
+            ).fetchone()
+            if existing:
+                if existing["operation"] != operation:
+                    raise ConflictError("idempotency key was already used for another operation")
+                return self.store.decode(existing["response"])
             response = action()
             self.store.connection.execute(
                 "INSERT INTO idempotency(key, operation, response) VALUES (?, ?, ?)",
@@ -55,12 +69,24 @@ class FhirVault:
             raise NotFoundError(f"{resource_type}/{resource_id} was not found")
         return row
 
-    def _write(self, validated: ValidatedResource, *, reject_existing: bool) -> dict[str, Any]:
+    def _write(self, validated: ValidatedResource, *, reject_existing: bool, if_match: str | None = None) -> dict[str, Any]:
         row = self.store.connection.execute(
             "SELECT current_version, deleted FROM resources WHERE type = ? AND id = ?",
             (validated.resource_type, validated.resource_id),
         ).fetchone()
-        if row is not None and not row["deleted"] and reject_existing:
+        live = row is not None and not row["deleted"]
+        if if_match is not None:
+            label = f"{validated.resource_type}/{validated.resource_id}"
+            if not live:
+                raise OperationOutcomeError(404, "not-found", f"{label} was not found")
+            current = str(row["current_version"])
+            if if_match != "*" and if_match != current:
+                raise OperationOutcomeError(
+                    412,
+                    "conflict",
+                    f'If-Match version "{if_match}" is not the current version "{current}" of {label}',
+                )
+        if live and reject_existing:
             raise ConflictError(f"{validated.resource_type}/{validated.resource_id} already exists")
         version = 1 if row is None else row["current_version"] + 1
         moment = self.store.now()
@@ -90,6 +116,7 @@ class FhirVault:
 
     # ------------------------------------------------------------------ resources
 
+    @_serialized
     def create(self, resource_type: str, raw: Any, key: str | None = None) -> dict[str, Any]:
         if resource_type not in RESOURCE_TYPES:
             raise NotFoundError(f"resource type {resource_type} is not supported")
@@ -101,21 +128,32 @@ class FhirVault:
             lambda: self._write(validated, reject_existing=True),
         )
 
+    @_serialized
     def read(self, resource_type: str, resource_id: str) -> dict[str, Any]:
         validate_path_id(resource_id)
         row = self._require(resource_type, resource_id)
         return self.store.decode(row["document"])
 
-    def update(self, resource_type: str, resource_id: str, raw: Any, key: str | None = None) -> dict[str, Any]:
+    @_serialized
+    def update(
+        self,
+        resource_type: str,
+        resource_id: str,
+        raw: Any,
+        key: str | None = None,
+        if_match: str | None = None,
+    ) -> dict[str, Any]:
         validate_path_id(resource_id)
+        expected = parse_if_match(if_match)
         validated = parse_resource(resource_type, raw, expected_id=resource_id)
         self._assert_references(validated)
         return self._idempotent(
             key,
             f"update:{resource_type}/{resource_id}",
-            lambda: self._write(validated, reject_existing=False),
+            lambda: self._write(validated, reject_existing=False, if_match=expected),
         )
 
+    @_serialized
     def delete(self, resource_type: str, resource_id: str, key: str | None = None) -> dict[str, Any]:
         validate_path_id(resource_id)
 
@@ -140,6 +178,7 @@ class FhirVault:
 
         return self._idempotent(key, f"delete:{resource_type}/{resource_id}", apply)
 
+    @_serialized
     def history(self, resource_type: str, resource_id: str) -> dict[str, Any]:
         validate_path_id(resource_id)
         if resource_type not in RESOURCE_TYPES:
@@ -169,6 +208,7 @@ class FhirVault:
             )
         return {"resourceType": resource_type, "id": resource_id, "deleted": bool(head["deleted"]), "entries": entries}
 
+    @_serialized
     def search(self, resource_type: str, parameters: dict[str, list[str]]) -> dict[str, Any]:
         if resource_type not in RESOURCE_TYPES:
             raise NotFoundError(f"resource type {resource_type} is not supported")
@@ -233,6 +273,7 @@ class FhirVault:
 
     # ------------------------------------------------------------------ subscriptions
 
+    @_serialized
     def create_subscription(self, raw: Any, key: str | None = None, payload_id: Any = None) -> dict[str, Any]:
         subscription_id, criteria, reason = parse_subscription(raw, payload_id)
 
@@ -251,6 +292,7 @@ class FhirVault:
 
         return self._idempotent(key, f"create-subscription:{subscription_id}", apply)
 
+    @_serialized
     def events(self, subscription_id: str) -> dict[str, Any]:
         row = self.store.connection.execute(
             "SELECT id, criteria FROM subscriptions WHERE id = ?", (subscription_id,)

@@ -10,6 +10,8 @@ The initial release intentionally supports a compact public contract:
 
 - three resource types: `Patient`, `Observation`, and `Encounter`;
 - full CRUD per resource, with server-managed `meta.versionId`;
+- optimistic concurrency on update: responses carry an `ETag` for the current
+  version and `PUT` accepts `If-Match` to reject stale writes with HTTP 412;
 - every write appends an immutable version; versions never decrease and old
   versions stay readable, including after a delete;
 - `reference` links must resolve to a live resource that is already stored;
@@ -66,8 +68,10 @@ Content-Type: application/json
 }
 ```
 
-Returns HTTP 201 with the stored resource. A duplicate id returns HTTP 409
-`conflict`; the same `Idempotency-Key` returns the original 201 body instead.
+Returns HTTP 201 with the stored resource, an `ETag` of `W/"1"` for the new
+version, and a `Location` header pointing at `/fhir/Patient/p-1`. A duplicate
+id returns HTTP 409 `conflict`; the same `Idempotency-Key` returns the
+original 201 body instead.
 
 ### Read a resource
 
@@ -88,6 +92,9 @@ GET /fhir/Patient/p-1
 }
 ```
 
+A successful read returns an `ETag` header such as `W/"1"` identifying the
+current version; clients can send it back as `If-Match` on a later update.
+
 ### Update a resource
 
 ```http
@@ -97,11 +104,60 @@ Idempotency-Key: patient-1-v2
 {"resourceType":"Patient","id":"p-1","gender":"female","birthDate":"1980-04-12","name.family":"Smith"}
 ```
 
-`PUT` is an unconditional upsert: it creates version 1 when the id is new and
-otherwise stores the next version of the same logical resource, returning HTTP
-200 with the new `meta.versionId`. The body `id` must equal the path id. A
-resource that was deleted can be recreated with `PUT`; the version sequence
-continues (`1`, `2`, `3`, …) and is never reused.
+`PUT` without `If-Match` is an unconditional upsert: it creates version 1 when
+the id is new and otherwise stores the next version of the same logical
+resource, returning HTTP 200 with the new `meta.versionId`, an `ETag` of
+`W/"<versionId>"`, and a `Location` header pointing at `/fhir/Patient/p-1`.
+The body `id` must equal the path id. A resource that was deleted can be
+recreated with `PUT`; the version sequence continues (`1`, `2`, `3`, …) and is
+never reused.
+
+### Conditional update with If-Match
+
+```http
+PUT /fhir/Patient/p-1
+Idempotency-Key: patient-1-v3
+If-Match: W/"2"
+
+{"resourceType":"Patient","id":"p-1","gender":"female","birthDate":"1980-04-12","name.family":"Smith"}
+```
+
+Sending `If-Match` makes the update conditional on the version the client
+last saw. The server compares the header with the resource's current
+`meta.versionId` and only then writes:
+
+- `If-Match: "2"` (strong) and `If-Match: W/"2"` (weak) are equivalent; both
+  match when the current version is `2`. `If-Match: *` matches any existing
+  resource.
+- On a match the update proceeds exactly like an unconditional `PUT`: HTTP
+  200 with the updated resource, a `Location` header, and a new `ETag`.
+- A missing `If-Match` is not an error; the unconditional upsert semantics
+  above apply.
+- A syntactically invalid `If-Match` returns HTTP 400 and changes nothing.
+- If the target resource does not exist (or is deleted), the update returns
+  HTTP 404.
+- If the version does not match, the update returns HTTP 412 and neither the
+  resource nor its version history changes.
+
+All three failures return an `application/fhir+json` `OperationOutcome` whose
+`issue.code` is `invalid`, `not-found`, or `conflict` respectively; the
+`conflict` diagnostics state that the provided version is not the current
+version:
+
+```json
+{
+  "resourceType": "OperationOutcome",
+  "issue": [{"severity": "error", "code": "conflict",
+             "diagnostics": "If-Match version \"1\" is not the current version \"2\" of Patient/p-1"}]
+}
+```
+
+Concurrent conditional updates are serialized: when two clients both send
+`If-Match` for version 10, the first request accepted creates version 11 and
+returns HTTP 200, and the second returns HTTP 412 without creating an extra
+version. Validation still runs on every update, so a body that fails
+structural or reference validation creates no version whether or not
+`If-Match` was sent.
 
 ### Delete a resource
 
@@ -301,6 +357,12 @@ never point at a resource type the vault does not store.
 | `not_found` | 404 | unknown resource id, unknown resource type, unknown route, unknown subscription |
 | `conflict` | 409 | duplicate create, or an idempotency key reused for another operation |
 | `internal_error` | 500 | unexpected failure |
+
+Failed conditional updates are reported instead as an `application/fhir+json`
+`OperationOutcome`: HTTP 400 with `issue.code` `invalid` for a malformed
+`If-Match`, HTTP 404 with `not-found` when the target resource does not
+exist, and HTTP 412 with `conflict` when the provided version is not the
+current version.
 
 ## Tests
 
