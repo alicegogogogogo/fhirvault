@@ -45,6 +45,7 @@ class Store:
               id TEXT PRIMARY KEY,
               criteria TEXT NOT NULL,
               reason TEXT,
+              channel TEXT,
               created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS events (
@@ -55,6 +56,28 @@ class Store:
               occurred_at TEXT NOT NULL,
               PRIMARY KEY (subscription_id, sequence)
             );
+            CREATE TABLE IF NOT EXISTS deliveries (
+              subscription_id TEXT NOT NULL,
+              sequence INTEGER NOT NULL,
+              delivery_id TEXT NOT NULL UNIQUE,
+              endpoint TEXT NOT NULL,
+              secret TEXT,
+              payload TEXT NOT NULL,
+              state TEXT NOT NULL,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              not_before TEXT,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (subscription_id, sequence)
+            );
+            CREATE TABLE IF NOT EXISTS delivery_attempts (
+              delivery_id TEXT NOT NULL,
+              attempt INTEGER NOT NULL,
+              attempted_at TEXT NOT NULL,
+              outcome TEXT NOT NULL,
+              http_status INTEGER,
+              error TEXT,
+              PRIMARY KEY (delivery_id, attempt)
+            );
             CREATE TABLE IF NOT EXISTS idempotency (
               key TEXT PRIMARY KEY,
               operation TEXT NOT NULL,
@@ -62,6 +85,11 @@ class Store:
             );
             """
         )
+        # Older databases predate the channel column; add it in place so old
+        # subscriptions remain event-only (NULL channel) without migration.
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(subscriptions)")}
+        if "channel" not in columns:
+            self.connection.execute("ALTER TABLE subscriptions ADD COLUMN channel")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

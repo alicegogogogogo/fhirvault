@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import uuid
 from typing import Any, Callable
 
+from .deliverer import RETRY_DELAYS, Deliverer
 from .errors import ConflictError, NotFoundError, OperationOutcomeError, ValidationError
 from .model import (
     RESOURCE_TYPES,
@@ -40,8 +42,30 @@ def _serialized(method: Callable) -> Callable:
 
 
 class FhirVault:
-    def __init__(self, database: str, clock: Callable[[], Any] | None = None):
+    def __init__(
+        self,
+        database: str,
+        clock: Callable[[], Any] | None = None,
+        *,
+        delivery: bool = True,
+        retry_delays: tuple[float, float] = RETRY_DELAYS,
+        transport: Callable[[str, bytes, dict[str, str]], tuple[int | None, str | None]] | None = None,
+    ):
         self.store = Store(database, clock)
+        # The background deliverer resumes persisted pending deliveries, so
+        # constructing the service also continues tasks left by an earlier run.
+        self.deliverer: Deliverer | None = (
+            Deliverer(self.store, retry_delays, transport=transport) if delivery else None
+        )
+
+    def close(self) -> None:
+        if self.deliverer is not None:
+            self.deliverer.close()
+            self.deliverer = None
+
+    def _wake(self) -> None:
+        if self.deliverer is not None:
+            self.deliverer.wake()
 
     # ------------------------------------------------------------------ helpers
 
@@ -61,6 +85,9 @@ class FhirVault:
                 "INSERT INTO idempotency(key, operation, response) VALUES (?, ?, ?)",
                 (key, operation, self.store.encode(response)),
             )
+        # The write and its delivery tasks committed together; let the worker
+        # pick them up immediately. Querying/replaying never reaches here.
+        self._wake()
         return response
 
     def _require(self, resource_type: str, resource_id: str) -> Any:
@@ -465,20 +492,24 @@ class FhirVault:
 
     @_serialized
     def create_subscription(self, raw: Any, key: str | None = None, payload_id: Any = None) -> dict[str, Any]:
-        subscription_id, criteria, reason = parse_subscription(raw, payload_id)
+        subscription_id, criteria, reason, channel = parse_subscription(raw, payload_id)
 
         def apply() -> dict[str, Any]:
             moment = self.store.now()
             try:
                 self.store.connection.execute(
-                    "INSERT INTO subscriptions(id, criteria, reason, created_at) VALUES (?, ?, ?, ?)",
-                    (subscription_id, self.store.encode(criteria), reason, moment),
+                    "INSERT INTO subscriptions(id, criteria, reason, channel, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (subscription_id, self.store.encode(criteria), reason,
+                     self.store.encode(channel) if channel is not None else None, moment),
                 )
             except Exception as error:
                 if "UNIQUE constraint" in str(error):
                     raise ConflictError(f"Subscription/{subscription_id} already exists") from error
                 raise
-            return {"subscription_id": subscription_id, "created_at": moment, "criteria": criteria, "reason": reason}
+            response = {"subscription_id": subscription_id, "created_at": moment, "criteria": criteria, "reason": reason}
+            if channel is not None:
+                response["channel"] = channel
+            return response
 
         return self._idempotent(key, f"create-subscription:{subscription_id}", apply)
 
@@ -499,6 +530,44 @@ class FhirVault:
             "events": [self.store.decode(stored["payload"]) for stored in rows],
         }
 
+    @_serialized
+    def deliveries(self, subscription_id: str) -> dict[str, Any]:
+        row = self.store.connection.execute(
+            "SELECT id FROM subscriptions WHERE id = ?", (subscription_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"Subscription/{subscription_id} was not found")
+        rows = self.store.connection.execute(
+            "SELECT sequence, delivery_id, state, attempts FROM deliveries "
+            "WHERE subscription_id = ? ORDER BY sequence",
+            (subscription_id,),
+        ).fetchall()
+        deliveries: list[dict[str, Any]] = []
+        for delivery_row in rows:
+            attempt_rows = self.store.connection.execute(
+                "SELECT attempt, attempted_at, outcome, http_status, error FROM delivery_attempts "
+                "WHERE delivery_id = ? ORDER BY attempt",
+                (delivery_row["delivery_id"],),
+            ).fetchall()
+            deliveries.append(
+                {
+                    "sequence": delivery_row["sequence"],
+                    "deliveryId": delivery_row["delivery_id"],
+                    "state": delivery_row["state"],
+                    "attempts": [
+                        {
+                            "attempt": attempt_row["attempt"],
+                            "attemptedAt": attempt_row["attempted_at"],
+                            "outcome": attempt_row["outcome"],
+                            "httpStatus": attempt_row["http_status"],
+                            "error": attempt_row["error"],
+                        }
+                        for attempt_row in attempt_rows
+                    ],
+                }
+            )
+        return {"subscription_id": subscription_id, "total": len(deliveries), "deliveries": deliveries}
+
     def _record_events(
         self,
         resource_type: str,
@@ -509,7 +578,7 @@ class FhirVault:
         moment: str,
     ) -> None:
         rows = self.store.connection.execute(
-            "SELECT id, criteria FROM subscriptions ORDER BY id"
+            "SELECT id, criteria, channel FROM subscriptions ORDER BY id"
         ).fetchall()
         for row in rows:
             criteria = self.store.decode(row["criteria"])
@@ -519,18 +588,37 @@ class FhirVault:
                 "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM events WHERE subscription_id = ?",
                 (row["id"],),
             ).fetchone()
+            sequence = sequence_row["sequence"]
             payload = {
-                "sequence": sequence_row["sequence"],
+                "sequence": sequence,
                 "subscription_id": row["id"],
                 "event": event,
                 "resource": f"{resource_type}/{resource_id}",
                 "version": version,
                 "occurredAt": moment,
             }
+            encoded_payload = self.store.encode(payload)
             self.store.connection.execute(
                 "INSERT INTO events(subscription_id, sequence, type, payload, occurred_at) VALUES (?, ?, ?, ?, ?)",
-                (row["id"], payload["sequence"], event, self.store.encode(payload), moment),
+                (row["id"], sequence, event, encoded_payload, moment),
             )
+            # The event is always recorded; a channel turns the same write into
+            # a persisted delivery task, carrying the original event JSON.
+            if row["channel"] is not None:
+                channel = self.store.decode(row["channel"])
+                self.store.connection.execute(
+                    "INSERT INTO deliveries(subscription_id, sequence, delivery_id, endpoint, secret, "
+                    "payload, state, attempts, not_before, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, NULL, ?)",
+                    (
+                        row["id"],
+                        sequence,
+                        uuid.uuid4().hex,
+                        channel["endpoint"],
+                        channel.get("secret"),
+                        encoded_payload,
+                        moment,
+                    ),
+                )
 
     # ------------------------------------------------------------------ references
 

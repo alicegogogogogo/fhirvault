@@ -1,9 +1,12 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
+import hashlib
+import hmac
 from datetime import datetime, timedelta, timezone
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -107,6 +110,7 @@ class FhirVaultTests(unittest.TestCase):
         self.port: int | None = None
 
     def tearDown(self):
+        self.service.close()
         self.directory.cleanup()
 
     # ---------------------------------------------------------------- http client
@@ -726,6 +730,7 @@ class ConditionalUpdateHttpTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
+        self.service.close()
         self.directory.cleanup()
 
     def request(self, method: str, path: str, payload: dict | None = None, headers: dict | None = None) -> tuple[int, dict, dict]:
@@ -877,6 +882,7 @@ class TransactionHttpTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
+        self.service.close()
         self.directory.cleanup()
 
     def request(self, method: str, path: str, payload: dict | None = None, headers: dict | None = None) -> tuple[int, dict, dict]:
@@ -1126,6 +1132,396 @@ class TransactionHttpTests(unittest.TestCase):
             transaction_bundle(txn_entry("POST", "Patient", patient("p-22"))), key="plain-create"
         )
         self.assert_outcome(status, headers, body, 409, "conflict")
+
+
+class WebhookDeliveryTests(unittest.TestCase):
+    """Subscription channels create persisted webhook tasks delivered in the
+    background with up to three attempts and durable retry state."""
+
+    SECRET = "s3cret-value"
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.directory.name) / "vault.db")
+        self.calls: list[dict] = []
+        self.scripted: list = []
+        self.gate: threading.Event | None = None
+        self.service = self.start_service()
+
+    def start_service(self, *, delivery: bool = True, scripted=None, delays=(0.02, 0.02)):
+        if scripted is not None:
+            self.scripted = list(scripted)
+
+        def transport(endpoint, body, headers):
+            self.calls.append({"endpoint": endpoint, "body": body, "headers": dict(headers)})
+            if self.gate is not None:
+                self.gate.wait(timeout=5)
+            if self.scripted:
+                result = self.scripted.pop(0)
+                return result if isinstance(result, tuple) else (result, None)
+            return 200, None
+
+        return FhirVault(
+            self.db_path,
+            FrozenClock(),
+            delivery=delivery,
+            retry_delays=delays,
+            transport=transport if delivery else None,
+        )
+
+    def restart_service(self, **kwargs):
+        self.service.close()
+        self.service = self.start_service(**kwargs)
+
+    def tearDown(self):
+        if self.gate is not None:
+            self.gate.set()
+        self.service.close()
+        self.directory.cleanup()
+
+    def wait_until(self, predicate, timeout: float = 5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        self.fail("condition was not met before the timeout")
+
+    def channel(self, endpoint: str = "https://example.invalid/hooks", secret=None):
+        value = {"endpoint": endpoint}
+        if secret is not None:
+            value["secret"] = secret
+        return value
+
+    def first_delivery(self, subscription_id: str = "sub-hook"):
+        return self.service.deliveries(subscription_id)["deliveries"][0]
+
+    # ------------------------------------------------------------------ validation
+
+    def test_channel_validation_is_strict_and_writes_nothing(self):
+        self.service.close()
+        self.service = self.start_service(delivery=False)
+        bad_channels = [
+            ("/relative/path", "absolute http or https URL"),
+            ("ftp://example.invalid/hooks", "absolute http or https URL"),
+            ("http://example.invalid/hooks?x=1", "query string"),
+            ("http://example.invalid/hooks#frag", "fragment"),
+            ("http://user:pass@example.invalid/hooks", "user information"),
+            ("http://example.invalid/hooks?", "query string"),
+        ]
+        for index, (endpoint, message) in enumerate(bad_channels):
+            with self.assertRaisesRegex(ValidationError, message):
+                self.service.create_subscription(
+                    {"id": "sub-bad", "criteria": {"type": "Patient"}, "channel": {"endpoint": endpoint}},
+                    f"bad-url-{index}",
+                )
+        with self.assertRaisesRegex(ValidationError, "non-empty string"):
+            self.service.create_subscription(
+                {"id": "sub-bad", "criteria": {"type": "Patient"},
+                 "channel": {"endpoint": "https://example.invalid", "secret": ""}},
+                "bad-secret",
+            )
+        with self.assertRaisesRegex(ValidationError, "unknown fields"):
+            self.service.create_subscription(
+                {"id": "sub-bad", "criteria": {"type": "Patient"},
+                 "channel": {"endpoint": "https://example.invalid", "type": "rest-hook"}},
+                "bad-extra",
+            )
+        # The rejected id is still free, proving nothing was written.
+        created = self.service.create_subscription(
+            {"id": "sub-bad", "criteria": {"type": "Patient"},
+             "channel": {"endpoint": "https://example.invalid/hooks"}},
+            "bad-recovered",
+        )
+        self.assertEqual("sub-bad", created["subscription_id"])
+        self.assertNotIn("secret", created["channel"])
+
+    def test_channel_without_secret_is_echoed_without_signature_later(self):
+        created = self.service.create_subscription(
+            {"id": "sub-plain", "criteria": {"type": "Patient"},
+             "channel": {"endpoint": "http://example.invalid/h"}},
+            "plain-key",
+        )
+        self.assertEqual({"endpoint": "http://example.invalid/h"}, created["channel"])
+
+    def test_subscription_without_channel_records_events_but_no_deliveries(self):
+        self.service.create_subscription({"id": "sub-old", "criteria": {"type": "Patient"}}, "old-key")
+        self.service.create("Patient", patient("p-50"), "old-write")
+        self.assertEqual(1, self.service.events("sub-old")["total"])
+        view = self.service.deliveries("sub-old")
+        self.assertEqual({"subscription_id": "sub-old", "total": 0, "deliveries": []}, view)
+        self.assertEqual([], self.calls)
+
+    # ------------------------------------------------------------------ delivery
+
+    def test_successful_delivery_posts_event_json_with_headers(self):
+        self.service.create_subscription(
+            {"id": "sub-hook", "criteria": {"type": "Patient"}, "channel": self.channel()},
+            "hook-key",
+        )
+        self.service.create("Patient", patient("p-51"), "write-key")
+        event = self.service.events("sub-hook")["events"][0]
+        self.wait_until(lambda: self.calls)
+        call = self.calls[0]
+        self.assertEqual("https://example.invalid/hooks", call["endpoint"])
+        self.assertEqual(json.dumps(event, separators=(",", ":"), sort_keys=True).encode(), call["body"])
+        self.assertEqual("sub-hook", call["headers"]["X-FhirVault-Subscription"])
+        self.assertEqual("1", call["headers"]["X-FhirVault-Sequence"])
+        self.assertNotIn("X-FhirVault-Signature", call["headers"])
+        self.wait_until(lambda: self.first_delivery()["state"] == "delivered")
+        delivery = self.first_delivery()
+        self.assertEqual(call["headers"]["X-FhirVault-Delivery"], delivery["deliveryId"])
+        self.assertEqual(1, delivery["attempts"][0]["attempt"])
+        self.assertEqual("success", delivery["attempts"][0]["outcome"])
+        self.assertEqual(200, delivery["attempts"][0]["httpStatus"])
+        self.assertIsNone(delivery["attempts"][0]["error"])
+
+    def test_signature_is_hmac_sha256_hex_of_the_body(self):
+        self.service.create_subscription(
+            {"id": "sub-hook", "criteria": {"type": "Patient"},
+             "channel": self.channel(secret=self.SECRET)},
+            "secret-key",
+        )
+        self.service.create("Patient", patient("p-52"), "secret-write")
+        self.wait_until(lambda: self.first_delivery()["state"] == "delivered")
+        call = self.calls[0]
+        expected = hmac.new(self.SECRET.encode(), call["body"], hashlib.sha256).hexdigest()
+        self.assertEqual(expected, call["headers"]["X-FhirVault-Signature"])
+        self.assertRegex(expected, r"^[0-9a-f]{64}$")
+
+    def test_2xx_family_all_succeeds(self):
+        self.restart_service(scripted=[204])
+        self.service.create_subscription(
+            {"id": "sub-hook", "criteria": {"type": "Patient"}, "channel": self.channel()}, "k1"
+        )
+        self.service.create("Patient", patient("p-53"), "k2")
+        self.wait_until(lambda: self.first_delivery()["state"] == "delivered")
+        self.assertEqual(204, self.first_delivery()["attempts"][0]["httpStatus"])
+
+    def test_failures_retry_after_backoff_and_then_succeed_with_stable_identity(self):
+        self.restart_service(scripted=[500, (None, "connection reset"), 202])
+        self.service.create_subscription(
+            {"id": "sub-hook", "criteria": {"type": "Patient"},
+             "channel": self.channel(secret=self.SECRET)},
+            "k1",
+        )
+        started = time.monotonic()
+        self.service.create("Patient", patient("p-54"), "k2")
+        self.wait_until(lambda: self.first_delivery()["state"] == "delivered")
+        self.assertGreaterEqual(time.monotonic() - started, 0.04)
+        delivery = self.first_delivery()
+        self.assertEqual(3, len(delivery["attempts"]))
+        self.assertEqual(["failure", "failure", "success"], [a["outcome"] for a in delivery["attempts"]])
+        self.assertEqual([500, None, 202], [a["httpStatus"] for a in delivery["attempts"]])
+        self.assertEqual("endpoint responded with HTTP 500", delivery["attempts"][0]["error"])
+        self.assertEqual("connection reset", delivery["attempts"][1]["error"])
+        self.assertIsNone(delivery["attempts"][2]["error"])
+        self.assertEqual(3, len(self.calls))
+        delivery_ids = {call["headers"]["X-FhirVault-Delivery"] for call in self.calls}
+        sequences = {call["headers"]["X-FhirVault-Sequence"] for call in self.calls}
+        signatures = {call["headers"]["X-FhirVault-Signature"] for call in self.calls}
+        self.assertEqual({delivery["deliveryId"]}, delivery_ids)
+        self.assertEqual({"1"}, sequences)
+        self.assertEqual(1, len(signatures))
+
+    def test_three_failures_reach_failed_state(self):
+        self.restart_service(scripted=[503, (None, "connection refused"), 404])
+        self.service.create_subscription(
+            {"id": "sub-hook", "criteria": {"type": "Patient"}, "channel": self.channel()}, "k1"
+        )
+        self.service.create("Patient", patient("p-55"), "k2")
+        self.wait_until(lambda: self.first_delivery()["state"] == "failed")
+        delivery = self.first_delivery()
+        self.assertEqual(3, len(delivery["attempts"]))
+        self.assertEqual(["failure"] * 3, [a["outcome"] for a in delivery["attempts"]])
+        self.assertEqual([503, None, 404], [a["httpStatus"] for a in delivery["attempts"]])
+        self.assertTrue(all(a["error"] for a in delivery["attempts"]))
+        self.assertEqual(3, len(self.calls))
+
+    def test_delivery_is_pending_before_the_first_attempt_and_writes_do_not_wait(self):
+        self.gate = threading.Event()
+        self.restart_service()
+        self.service.create_subscription(
+            {"id": "sub-hook", "criteria": {"type": "Patient"}, "channel": self.channel()}, "k1"
+        )
+        self.service.create("Patient", patient("p-56"), "k2")
+        self.wait_until(lambda: self.first_delivery()["state"] == "pending" and self.calls)
+        delivery = self.first_delivery()
+        self.assertEqual("pending", delivery["state"])
+        self.gate.set()
+        self.wait_until(lambda: self.first_delivery()["state"] == "delivered")
+
+    def test_restart_resumes_a_pending_delivery_with_the_same_delivery_id(self):
+        # First process enqueues but never runs the task.
+        self.service.close()
+        self.service = self.start_service(delivery=False)
+        self.service.create_subscription(
+            {"id": "sub-hook", "criteria": {"type": "Patient"}, "channel": self.channel()}, "k1"
+        )
+        self.service.create("Patient", patient("p-57"), "k2")
+        pending = self.service.deliveries("sub-hook")["deliveries"][0]
+        self.assertEqual("pending", pending["state"])
+        self.assertEqual([], pending["attempts"])
+        # A fresh process resumes it on startup.
+        self.restart_service(scripted=[200])
+        self.wait_until(lambda: self.first_delivery()["state"] == "delivered")
+        delivery = self.first_delivery()
+        self.assertEqual(pending["deliveryId"], delivery["deliveryId"])
+        self.assertEqual(pending["sequence"], delivery["sequence"])
+        self.assertEqual(1, len(delivery["attempts"]))
+
+    def test_restart_mid_retry_continues_the_attempt_sequence(self):
+        self.restart_service(scripted=[500])
+        self.service.create_subscription(
+            {"id": "sub-hook", "criteria": {"type": "Patient"}, "channel": self.channel()}, "k1"
+        )
+        self.service.create("Patient", patient("p-58"), "k2")
+        self.wait_until(lambda: len(self.first_delivery()["attempts"]) == 1)
+        self.restart_service(scripted=[500, 200])
+        self.wait_until(lambda: self.first_delivery()["state"] == "delivered")
+        delivery = self.first_delivery()
+        self.assertEqual([1, 2, 3], [a["attempt"] for a in delivery["attempts"]])
+        self.assertEqual(["failure", "failure", "success"], [a["outcome"] for a in delivery["attempts"]])
+
+    def test_idempotent_replay_adds_neither_event_nor_task(self):
+        self.service.create_subscription(
+            {"id": "sub-hook", "criteria": {"type": "Patient"}, "channel": self.channel()}, "k1"
+        )
+        first = self.service.create("Patient", patient("p-59"), "shared-write")
+        replay = self.service.create("Patient", patient("p-59", gender="female"), "shared-write")
+        self.assertEqual(first, replay)
+        self.wait_until(lambda: self.first_delivery()["state"] == "delivered")
+        self.assertEqual(1, self.service.events("sub-hook")["total"])
+        self.assertEqual(1, self.service.deliveries("sub-hook")["total"])
+        self.assertEqual(1, len(self.calls))
+
+    def test_deliveries_are_ordered_by_sequence_and_unknown_subscription_is_404(self):
+        self.service.create_subscription(
+            {"id": "sub-hook", "criteria": {"type": "Patient"}, "channel": self.channel()}, "k1"
+        )
+        self.service.create("Patient", patient("p-60"), "k2")
+        self.service.create("Patient", patient("p-61"), "k3")
+        self.wait_until(lambda: len(self.calls) == 2)
+        view = self.service.deliveries("sub-hook")
+        self.assertEqual("sub-hook", view["subscription_id"])
+        self.assertEqual(2, view["total"])
+        self.assertEqual([1, 2], [d["sequence"] for d in view["deliveries"]])
+        for delivery in view["deliveries"]:
+            self.assertEqual({"sequence", "deliveryId", "state", "attempts"}, set(delivery))
+        with self.assertRaises(NotFoundError):
+            self.service.deliveries("sub-missing")
+
+    def test_queries_do_not_trigger_delivery(self):
+        self.gate = threading.Event()
+        self.restart_service()
+        self.service.create_subscription(
+            {"id": "sub-hook", "criteria": {"type": "Patient"}, "channel": self.channel()}, "k1"
+        )
+        self.service.create("Patient", patient("p-62"), "k2")
+        self.wait_until(lambda: self.calls)
+        self.gate.clear()
+        for _ in range(3):
+            self.service.deliveries("sub-hook")
+            self.service.events("sub-hook")
+        self.assertEqual(1, len(self.calls))
+        self.gate.set()
+        self.wait_until(lambda: self.first_delivery()["state"] == "delivered")
+
+
+class WebhookDeliveryHttpTests(unittest.TestCase):
+    """End-to-end: the worker really POSTs to a loopback HTTP receiver."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.received: list[dict] = []
+        self.receiver = ThreadingHTTPServer(("127.0.0.1", 0), self._receiver_handler())
+        self.endpoint = f"http://127.0.0.1:{self.receiver.server_address[1]}/hooks/fhir"
+        self.receiver_thread = threading.Thread(target=self.receiver.serve_forever, daemon=True)
+        self.receiver_thread.start()
+        self.service = FhirVault(str(Path(self.directory.name) / "vault.db"), FrozenClock())
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.service))
+        self.port = self.server.server_address[1]
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+
+    def _receiver_handler(self):
+        received = self.received
+
+        class Receiver(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                received.append({
+                    "path": self.path,
+                    "body": self.rfile.read(length),
+                    "headers": {key.lower(): self.headers[key] for key in self.headers},
+                })
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        return Receiver
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.receiver.shutdown()
+        self.receiver.server_close()
+        self.service.close()
+        self.server_thread.join(timeout=5)
+        self.receiver_thread.join(timeout=5)
+        self.directory.cleanup()
+
+    def wait_until(self, predicate, timeout: float = 5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        self.fail("webhook was not received before the timeout")
+
+    def request(self, method, path, payload=None, headers=None):
+        status, _, body = http_request(self.port, method, path, payload, headers)
+        return status, body
+
+    def test_webhook_is_delivered_over_http_and_status_endpoint_reports_it(self):
+        status, _ = self.request(
+            "POST", "/Subscription",
+            {"id": "sub-real", "criteria": {"type": "Patient"},
+             "channel": {"endpoint": self.endpoint, "secret": "topsecret"}},
+            {"Idempotency-Key": "real-sub"},
+        )
+        self.assertEqual(201, status)
+        status, _ = self.request("POST", "/fhir/Patient", patient("p-70"), {"Idempotency-Key": "real-write"})
+        self.assertEqual(201, status)
+        self.wait_until(lambda: self.received)
+        post = self.received[0]
+        self.assertEqual("/hooks/fhir", post["path"])
+        self.assertEqual("sub-real", post["headers"]["x-fhirvault-subscription"])
+        self.assertEqual("1", post["headers"]["x-fhirvault-sequence"])
+        event = self.service.events("sub-real")["events"][0]
+        self.assertEqual(json.dumps(event, separators=(",", ":"), sort_keys=True).encode(), post["body"])
+        expected = hmac.new(b"topsecret", post["body"], hashlib.sha256).hexdigest()
+        self.assertEqual(expected, post["headers"]["x-fhirvault-signature"])
+        delivered_view = self.service.deliveries("sub-real")["deliveries"][0]
+        self.assertEqual(delivered_view["deliveryId"], post["headers"]["x-fhirvault-delivery"])
+
+        def delivered():
+            _, body = self.request("GET", "/subscriptions/sub-real/deliveries")
+            return body if body["deliveries"] and body["deliveries"][0]["state"] == "delivered" else None
+
+        self.wait_until(delivered)
+        status, body = self.request("GET", "/subscriptions/sub-real/deliveries")
+        self.assertEqual(200, status)
+        self.assertEqual(1, body["total"])
+        self.assertEqual("delivered", body["deliveries"][0]["state"])
+        status, body = self.request("GET", "/subscriptions/nope/deliveries")
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", body["error"]["code"])
 
 
 if __name__ == "__main__":

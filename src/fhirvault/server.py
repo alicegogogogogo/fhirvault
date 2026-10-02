@@ -75,6 +75,8 @@ def make_handler(service: FhirVault) -> type[BaseHTTPRequestHandler]:
             if parts[:1] == ["subscriptions"]:
                 if self.command == "GET" and len(parts) == 3 and parts[2] == "events":
                     return 200, service.events(parts[1]), {}
+                if self.command == "GET" and len(parts) == 3 and parts[2] == "deliveries":
+                    return 200, service.deliveries(parts[1]), {}
                 raise NotFoundError("route was not found")
             raise NotFoundError("route was not found")
 
@@ -150,7 +152,13 @@ def main() -> None:
     service = FhirVault(arguments.database)
     server = ThreadingHTTPServer((arguments.host, arguments.port), make_handler(service))
     print(f"FhirVault listening on http://{arguments.host}:{arguments.port}", flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        service.close()
 
 
 if __name__ == "__main__":

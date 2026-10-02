@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
+from urllib.parse import urlsplit
 
 from .errors import NotFoundError, OperationOutcomeError, ValidationError
 
@@ -293,10 +294,10 @@ def search_match(
     return stored == value
 
 
-def parse_subscription(raw: Any, payload_id: Any) -> tuple[str, dict[str, Any], str | None]:
+def parse_subscription(raw: Any, payload_id: Any) -> tuple[str, dict[str, Any], str | None, dict[str, Any] | None]:
     if not isinstance(raw, dict) or "criteria" not in raw:
         raise ValidationError("subscription must contain criteria")
-    unknown = set(raw) - {"resourceType", "id", "criteria", "reason"}
+    unknown = set(raw) - {"resourceType", "id", "criteria", "reason", "channel"}
     if unknown:
         raise ValidationError(f"Subscription has unknown fields: {', '.join(sorted(unknown))}")
     if raw.get("resourceType") not in (None, SUBSCRIPTION_TYPE):
@@ -306,7 +307,39 @@ def parse_subscription(raw: Any, payload_id: Any) -> tuple[str, dict[str, Any], 
     reason = raw.get("reason")
     if reason is not None:
         _string(reason, "Subscription.reason")
-    return subscription_id, criteria, reason
+    channel = parse_channel(raw["channel"]) if "channel" in raw else None
+    return subscription_id, criteria, reason, channel
+
+
+def parse_channel(raw: Any) -> dict[str, Any]:
+    """Validate the optional rest-hook channel: an absolute http(s) endpoint
+    with no userinfo, query string, or fragment, plus an optional shared secret."""
+    if not isinstance(raw, dict):
+        raise ValidationError("Subscription.channel must be an object")
+    unknown = set(raw) - {"endpoint", "secret"}
+    if unknown:
+        raise ValidationError(f"Subscription.channel has unknown fields: {', '.join(sorted(unknown))}")
+    endpoint = raw.get("endpoint")
+    if not isinstance(endpoint, str) or not endpoint:
+        raise ValidationError("Subscription.channel.endpoint must be a non-empty string")
+    if "?" in endpoint or "#" in endpoint:
+        raise ValidationError(
+            "Subscription.channel.endpoint must not contain a query string or a fragment"
+        )
+    parts = urlsplit(endpoint)
+    if parts.scheme not in ("http", "https"):
+        raise ValidationError("Subscription.channel.endpoint must be an absolute http or https URL")
+    if not parts.hostname:
+        raise ValidationError("Subscription.channel.endpoint must include a host")
+    if "@" in parts.netloc:
+        raise ValidationError("Subscription.channel.endpoint must not contain user information")
+    channel: dict[str, Any] = {"endpoint": endpoint}
+    if "secret" in raw:
+        secret = raw["secret"]
+        if not isinstance(secret, str) or not secret:
+            raise ValidationError("Subscription.channel.secret must be a non-empty string when provided")
+        channel["secret"] = secret
+    return channel
 
 
 def parse_criteria(raw: Any) -> dict[str, Any]:

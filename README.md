@@ -19,6 +19,9 @@ The initial release intentionally supports a compact public contract:
   reference, with deterministic ordering;
 - subscriptions match `created`, `updated`, and `deleted` changes and record an
   ordered delivery event each time;
+- a subscription with a `channel` is also delivered as an HTTP webhook, with
+  durable persistence and automatic retries until the endpoint accepts it or
+  three attempts fail;
 - `POST /fhir` applies a transaction Bundle atomically: every entry succeeds or
   the whole batch rolls back;
 - repeated state-changing requests with the same `Idempotency-Key` return the
@@ -384,6 +387,107 @@ only `type` set, the subscription matches every write of that type. A matching
 subscription records an event for each `created`, `updated`, and `deleted`
 change; criteria are evaluated against the new stored document, and a delete
 matches against the last live version.
+
+An optional `channel` turns the subscription into a webhook:
+
+```json
+{
+  "resourceType": "Subscription",
+  "id": "sub-hook",
+  "reason": "POST every female patient change",
+  "criteria": {"type": "Patient", "field": "gender", "equals": "female"},
+  "channel": {"endpoint": "https://example.invalid/hooks/fhir", "secret": "s3cret"}
+}
+```
+
+`channel` accepts exactly `endpoint` and the optional `secret`:
+
+- `endpoint` must be an absolute `http`/`https` URL with a host and must not
+  contain user information (`user:pass@`), a query string, or a fragment;
+- `secret`, when present, must be a non-empty string.
+
+An invalid `channel` rejects the create with HTTP 400 `validation_error` and
+writes nothing. A subscription without a channel keeps the old behaviour:
+matching writes are only recorded as events. Old subscriptions and old rows are
+not migrated. A channel is echoed back in the create response under `channel`.
+
+### Webhook delivery
+
+Every matching write both records the original event and, for a subscription
+with a channel, creates a durable delivery task in the same commit. The write
+response is never delayed by delivery. Each task is delivered as:
+
+```http
+POST <endpoint>
+Content-Type: application/json
+X-FhirVault-Subscription: sub-hook
+X-FhirVault-Sequence: 2
+X-FhirVault-Delivery: 9f1c…
+X-FhirVault-Signature: 4b8e…   (only when a secret is configured)
+```
+
+- the body is exactly the original event JSON (the same object stored in the
+  event log and returned by `/events`);
+- `X-FhirVault-Delivery` is a unique `deliveryId` for the delivery;
+- `X-FhirVault-Signature`, sent when the subscription has a secret, is the
+  lowercase hex HMAC-SHA256 of the request body bytes keyed by the secret.
+
+A response of any 2xx status counts as success and the delivery reaches the
+terminal state `delivered`. A non-2xx response or a transport error (DNS,
+connection, timeout, …) counts as a failure; the delivery stays `pending` and
+is retried after 1 second, then after 2 seconds. Success on any attempt ends
+the delivery as `delivered`; a third consecutive failure ends it as `failed`.
+The delivery keeps the same `deliveryId`, sequence, and signature on every
+attempt, so the receiver can deduplicate redeliveries.
+
+Tasks are persisted, so a process restart resumes every unfinished delivery
+(including waiting out the remaining retry delay). Queries never trigger
+delivery.
+
+### Subscription delivery status
+
+```http
+GET /subscriptions/sub-hook/deliveries
+```
+
+```json
+{
+  "subscription_id": "sub-hook",
+  "total": 2,
+  "deliveries": [
+    {
+      "sequence": 1,
+      "deliveryId": "9f1c…",
+      "state": "delivered",
+      "attempts": [
+        {"attempt": 1, "attemptedAt": "2026-01-05T09:00:00.009Z",
+         "outcome": "success", "httpStatus": 200, "error": null}
+      ]
+    },
+    {
+      "sequence": 2,
+      "deliveryId": "2aa7…",
+      "state": "failed",
+      "attempts": [
+        {"attempt": 1, "attemptedAt": "2026-01-05T09:00:00.011Z",
+         "outcome": "failure", "httpStatus": 500, "error": "endpoint responded with HTTP 500"},
+        {"attempt": 2, "attemptedAt": "2026-01-05T09:00:01.012Z",
+         "outcome": "failure", "httpStatus": null, "error": "could not connect"},
+        {"attempt": 3, "attemptedAt": "2026-01-05T09:00:03.013Z",
+         "outcome": "failure", "httpStatus": 404, "error": "endpoint responded with HTTP 404"}
+      ]
+    }
+  ]
+}
+```
+
+`deliveries` are ordered by ascending `sequence`. Each delivery exposes
+`sequence`, `deliveryId`, `state` (`pending`, `delivered`, or `failed`), and an
+`attempts` array; each attempt has `attempt` (1-based), `attemptedAt`,
+`outcome` (`success` or `failure`), `httpStatus` (the response status or
+`null`), and `error` (the failure reason or `null`). Deliveries only exist for
+subscriptions that had a channel when the matching write committed; an unknown
+subscription returns HTTP 404 `not_found`.
 
 ### Subscription delivery events
 
