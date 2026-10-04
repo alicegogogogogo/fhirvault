@@ -25,7 +25,9 @@ The initial release intentionally supports a compact public contract:
 - `POST /fhir` applies a transaction Bundle atomically: every entry succeeds or
   the whole batch rolls back;
 - repeated state-changing requests with the same `Idempotency-Key` return the
-  first response.
+  first response;
+- every completed resource, Bundle, and Subscription request is recorded in a
+  durable access audit queryable at `GET /audit`.
 
 ## Requirements
 
@@ -45,7 +47,8 @@ bound the port.
 
 All request and response bodies are JSON. Unknown fields are rejected with
 `validation_error`. State-changing `POST`, `PUT`, and `DELETE` requests require
-an `Idempotency-Key` header.
+an `Idempotency-Key` header. The optional `X-FhirVault-Actor` header names the
+actor recorded in the access audit; a missing or blank value is `anonymous`.
 
 ### Health
 
@@ -471,6 +474,70 @@ receivers can deduplicate uncertain redeliveries. Delivery tasks are persisted:
 restarting the service resumes pending deliveries, and querying the endpoint
 never triggers a delivery. A missing subscription answers HTTP 404
 `not_found`.
+
+### Access audit
+
+Every completed request against a resource, Bundle, or Subscription HTTP entry
+point records one audit event. `GET /health`, `GET /audit` itself, and the
+background webhook retries are not recorded. The actor is taken from the
+`X-FhirVault-Actor` request header; when the header is missing or blank the
+actor is recorded as `anonymous`. Audit events never contain request bodies,
+query values, subscription secrets, webhook signatures, or idempotency keys.
+
+```http
+GET /audit?actor=alice&action=create&outcome=success&resourceType=Patient&resourceId=p-1
+```
+
+```json
+{
+  "total": 1,
+  "count": 1,
+  "offset": 0,
+  "sort": "sequence",
+  "entry": [
+    {
+      "sequence": 1,
+      "occurredAt": "2026-01-05T09:00:00.010Z",
+      "actor": "alice",
+      "action": "create",
+      "outcome": "success",
+      "status": 201,
+      "resourceType": "Patient",
+      "resourceId": "p-1",
+      "version": 1,
+      "replayed": false,
+      "changes": []
+    }
+  ]
+}
+```
+
+- `sequence` is globally unique, strictly increasing, and never reused after a
+  restart. Entries are returned in ascending `sequence` by default.
+- `action` is the public operation: `create`, `read`, `update`, `delete`,
+  `search`, `history`, `transaction`, `create-subscription`, `events`, or
+  `deliveries`.
+- `outcome` is `success` or `failure`; `status` is the actual HTTP status.
+  `resourceType`, `resourceId`, and `version` are `null` when the request has
+  no single resource or version (for example a search or a transaction).
+- A successful transaction records one `transaction` event whose `changes`
+  list follows entry order, each item giving `method`, `resourceType`, `id`,
+  `version`, and `deleted`. A failed transaction rolls back and is then
+  recorded as a `failure` event with an empty `changes`.
+- A successful write's audit event commits atomically with its resource
+  versions, subscription events, delivery tasks, and transaction result. A
+  failed request is rolled back first and then recorded independently.
+- Replaying an idempotent request still records a new event with
+  `"replayed": true`, but creates no new version, subscription event, delivery
+  task, or change, and its `changes` is empty.
+
+The query supports exact filters `actor`, `action`, `outcome`,
+`resourceType`, and `resourceId` (repeated values of one filter combine with
+OR; different filters combine with AND), plus `_count` (0–1000), `_offset`,
+and `_sort=sequence` (default) or `-sequence`. Unknown parameters, an
+out-of-range or non-integer page, or a bad sort fail the whole request with
+HTTP 400 `validation_error` and return no partial results. The audit log is
+durable: events recorded before a restart stay queryable afterwards.
 
 ### Field reference
 

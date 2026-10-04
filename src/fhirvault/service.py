@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import functools
 import hashlib
 import hmac
@@ -7,7 +8,7 @@ import threading
 import time
 import uuid
 from http.client import HTTPConnection, HTTPSConnection
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 from urllib.parse import urlsplit
 
 from .errors import ConflictError, NotFoundError, OperationOutcomeError, ValidationError
@@ -38,6 +39,66 @@ _EXPANSION_PARAMETERS = ("_include", "_revinclude")
 _DELIVERY_TIMEOUT = 5.0
 _RETRY_DELAYS = (1.0, 2.0)
 _MAX_ATTEMPTS = 3
+
+# Persistent access audit. A request carries an AuditContext (set by the HTTP
+# layer for the resource, Bundle, and Subscription entry points); direct
+# service calls and the background delivery worker leave it unset and create
+# no audit events.
+_CURRENT_AUDIT: contextvars.ContextVar["AuditContext | None"] = contextvars.ContextVar(
+    "fhirvault_audit", default=None
+)
+# During an idempotent write this holds the ordered list of resource changes
+# produced by the write; only transaction audit events report it. It is unset
+# outside a write, so internal callers never accumulate changes.
+_CURRENT_CHANGES: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.ContextVar(
+    "fhirvault_changes", default=None
+)
+
+# Action names exposed on audit events.
+_ACTION_CREATE = "create"
+_ACTION_READ = "read"
+_ACTION_UPDATE = "update"
+_ACTION_DELETE = "delete"
+_ACTION_SEARCH = "search"
+_ACTION_HISTORY = "history"
+_ACTION_TRANSACTION = "transaction"
+_ACTION_CREATE_SUBSCRIPTION = "create-subscription"
+
+# GET /audit accepts exactly these parameters.
+_AUDIT_FILTERS = ("actor", "action", "outcome", "resourceType", "resourceId")
+_AUDIT_CONTROLS = ("_count", "_offset", "_sort")
+
+
+class AuditContext(NamedTuple):
+    actor: str
+
+
+class AuditEventFields(NamedTuple):
+    """What a successful write audit row should carry, computed from the
+    response and the changes collected during the transaction."""
+
+    action: str
+    status: int
+    resource_type: str | None
+    resource_id: str | None
+    version: int | None
+    changes: list[dict[str, Any]]
+
+
+class audit_scope:
+    """Bind an audit actor for the duration of one handled HTTP request."""
+
+    def __init__(self, actor: str | None):
+        self._token: Any = None
+        self._actor = (actor or "").strip() or "anonymous"
+
+    def __enter__(self) -> "AuditContext":
+        context = AuditContext(self._actor)
+        self._token = _CURRENT_AUDIT.set(context)
+        return context
+
+    def __exit__(self, *exc: Any) -> None:
+        _CURRENT_AUDIT.reset(self._token)
 
 
 def _serialized(method: Callable) -> Callable:
@@ -77,23 +138,199 @@ class FhirVault:
 
     # ------------------------------------------------------------------ helpers
 
-    def _idempotent(self, key: str | None, operation: str, action: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    def _idempotent(
+        self,
+        key: str | None,
+        operation: str,
+        action: Callable[[], dict[str, Any]],
+        *,
+        audit: Callable[[dict[str, Any], list[dict[str, Any]], bool], "AuditEventFields | None"] | None = None,
+    ) -> dict[str, Any]:
         if not key:
             raise ValidationError("Idempotency-Key header is required")
         with self.store.transaction():
             existing = self.store.connection.execute(
                 "SELECT operation, response FROM idempotency WHERE key = ?", (key,)
             ).fetchone()
+            replayed = existing is not None
             if existing:
                 if existing["operation"] != operation:
                     raise ConflictError("idempotency key was already used for another operation")
-                return self.store.decode(existing["response"])
-            response = action()
-            self.store.connection.execute(
-                "INSERT INTO idempotency(key, operation, response) VALUES (?, ?, ?)",
-                (key, operation, self.store.encode(response)),
-            )
+                response = self.store.decode(existing["response"])
+                changes: list[dict[str, Any]] = []
+            else:
+                token = _CURRENT_CHANGES.set([])
+                try:
+                    response = action()
+                finally:
+                    changes = _CURRENT_CHANGES.get()
+                    _CURRENT_CHANGES.reset(token)
+                self.store.connection.execute(
+                    "INSERT INTO idempotency(key, operation, response) VALUES (?, ?, ?)",
+                    (key, operation, self.store.encode(response)),
+                )
+            if audit is not None and _CURRENT_AUDIT.get() is not None:
+                fields = audit(response, changes, replayed)
+                if fields is not None:
+                    self._insert_audit(
+                        action_name=fields.action,
+                        status=fields.status,
+                        resource_type=fields.resource_type,
+                        resource_id=fields.resource_id,
+                        version=fields.version,
+                        replayed=replayed,
+                        changes=fields.changes,
+                    )
         return response
+
+    def _insert_audit(
+        self,
+        *,
+        action_name: str,
+        status: int,
+        resource_type: str | None,
+        resource_id: str | None,
+        version: int | None,
+        replayed: bool,
+        changes: list[dict[str, Any]] | None,
+    ) -> None:
+        """Insert one audit event inside the caller's open transaction.
+
+        The actor comes from the request's AuditContext; the AUTOINCREMENT
+        sequence is assigned at insert, so the event commits atomically with
+        the resource versions, subscription events, delivery tasks, and the
+        idempotency record written earlier in the same transaction.
+        """
+        context = _CURRENT_AUDIT.get()
+        if context is None:
+            return
+        self.store.connection.execute(
+            "INSERT INTO audit_events(occurred_at, actor, action, outcome, status, "
+            "resource_type, resource_id, version, replayed, changes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                self.store.now(),
+                context.actor,
+                action_name,
+                "success",
+                status,
+                resource_type,
+                resource_id,
+                version,
+                1 if replayed else 0,
+                self.store.encode(changes or []),
+            ),
+        )
+
+    @_serialized
+    def record_failure_audit(
+        self,
+        *,
+        action: str,
+        status: int,
+        resource_type: str | None = None,
+        resource_id: str | None = None,
+    ) -> None:
+        """Record a failed request after its business transaction rolled back.
+
+        Runs in its own transaction so the failure is persisted independently
+        of the rolled-back work. Never raises: an audit problem must not mask
+        the response the client is about to receive.
+        """
+        if _CURRENT_AUDIT.get() is None:
+            return
+        try:
+            with self.store.transaction():
+                self.store.connection.execute(
+                    "INSERT INTO audit_events(occurred_at, actor, action, outcome, status, "
+                    "resource_type, resource_id, version, replayed, changes) "
+                    "VALUES (?, ?, ?, 'failure', ?, ?, ?, NULL, 0, '[]')",
+                    (
+                        self.store.now(),
+                        _CURRENT_AUDIT.get().actor,
+                        action,
+                        status,
+                        resource_type,
+                        resource_id,
+                    ),
+                )
+        except Exception:
+            pass
+
+    @_serialized
+    def audit_query(self, parameters: dict[str, list[str]]) -> dict[str, Any]:
+        """Answer GET /audit: exact-match filters over the durable audit log.
+
+        Filters (actor, action, outcome, resourceType, resourceId) combine with
+        AND; repeated values of one filter combine with OR, mirroring resource
+        search. Anything else, a non-integer/out-of-range page, or a bad sort
+        is a validation_error and returns no results.
+        """
+        unknown = set(parameters) - set(_AUDIT_FILTERS) - set(_AUDIT_CONTROLS)
+        if unknown:
+            raise ValidationError(
+                f"unknown audit parameters: {', '.join(sorted(unknown))}; supported parameters are "
+                f"{', '.join(sorted(set(_AUDIT_FILTERS) | set(_AUDIT_CONTROLS)))}"
+            )
+        count: int | None = None
+        if "_count" in parameters:
+            raw_count = parameters["_count"][-1]
+            if not raw_count.isdigit() or int(raw_count) > 1000:
+                raise ValidationError("_count must be an integer between 0 and 1000")
+            count = int(raw_count)
+        offset = 0
+        if "_offset" in parameters:
+            raw_offset = parameters["_offset"][-1]
+            if not raw_offset.isdigit():
+                raise ValidationError("_offset must be a non-negative integer")
+            offset = int(raw_offset)
+        sort = parameters.get("_sort", ["sequence"])[0]
+        if sort not in ("sequence", "-sequence"):
+            raise ValidationError("_sort must be sequence or -sequence")
+
+        clauses: list[str] = []
+        values: list[Any] = []
+        for column, name in (
+            ("actor", "actor"),
+            ("action", "action"),
+            ("outcome", "outcome"),
+            ("resource_type", "resourceType"),
+            ("resource_id", "resourceId"),
+        ):
+            wanted = parameters.get(name)
+            if wanted:
+                clauses.append(f"{column} IN ({', '.join('?' for _ in wanted)})")
+                values.extend(wanted)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.store.connection.execute(
+            f"SELECT * FROM audit_events{where} ORDER BY sequence "
+            f"{'DESC' if sort == '-sequence' else 'ASC'}",
+            values,
+        ).fetchall()
+        total = len(rows)
+        page = rows[offset:] if count is None else rows[offset : offset + count]
+        return {
+            "total": total,
+            "count": len(page),
+            "offset": offset,
+            "sort": sort,
+            "entry": [
+                {
+                    "sequence": row["sequence"],
+                    "occurredAt": row["occurred_at"],
+                    "actor": row["actor"],
+                    "action": row["action"],
+                    "outcome": row["outcome"],
+                    "status": row["status"],
+                    "resourceType": row["resource_type"],
+                    "resourceId": row["resource_id"],
+                    "version": row["version"],
+                    "replayed": bool(row["replayed"]),
+                    "changes": self.store.decode(row["changes"]),
+                }
+                for row in page
+            ],
+        }
 
     def _require(self, resource_type: str, resource_id: str) -> Any:
         if resource_type not in RESOURCE_TYPES:
@@ -141,7 +378,32 @@ class FhirVault:
             (validated.resource_type, validated.resource_id, version, self.store.encode(document), moment),
         )
         self._record_events(validated.resource_type, validated.resource_id, "created" if version == 1 else "updated", version, document, moment)
+        self._record_change(
+            "POST" if reject_existing else "PUT", validated.resource_type, validated.resource_id, version, False
+        )
         return document
+
+    @staticmethod
+    def _record_change(
+        method: str, resource_type: str, resource_id: str, version: int, deleted: bool
+    ) -> None:
+        """Append a change to the active write's ordered change list.
+
+        The list is active for every idempotent write, but only a transaction
+        audit event reports it; standalone write events ignore it and carry an
+        empty ``changes``.
+        """
+        change_list = _CURRENT_CHANGES.get()
+        if change_list is not None:
+            change_list.append(
+                {
+                    "method": method,
+                    "resourceType": resource_type,
+                    "id": resource_id,
+                    "version": version,
+                    "deleted": deleted,
+                }
+            )
 
     @staticmethod
     def _compose(validated: ValidatedResource, version: int, moment: str) -> dict[str, Any]:
@@ -159,17 +421,59 @@ class FhirVault:
             raise NotFoundError(f"resource type {resource_type} is not supported")
         validated = parse_resource(resource_type, raw)
         self._assert_references(validated)
+
+        def audit(response: dict[str, Any], changes: list[dict[str, Any]], replayed: bool) -> AuditEventFields:
+            return AuditEventFields(
+                _ACTION_CREATE,
+                201,
+                resource_type,
+                response["id"],
+                int(response["meta"]["versionId"]),
+                [],
+            )
+
         return self._idempotent(
             key,
             f"create:{resource_type}/{validated.resource_id}",
             lambda: self._write(validated, reject_existing=True),
+            audit=audit,
         )
 
     @_serialized
     def read(self, resource_type: str, resource_id: str) -> dict[str, Any]:
         validate_path_id(resource_id)
         row = self._require(resource_type, resource_id)
-        return self.store.decode(row["document"])
+        document = self.store.decode(row["document"])
+        self._safe_read_audit(
+            _ACTION_READ, resource_type, resource_id, int(document["meta"]["versionId"])
+        )
+        return document
+
+    def _safe_read_audit(
+        self,
+        action: str,
+        resource_type: str | None,
+        resource_id: str | None,
+        version: int | None,
+    ) -> None:
+        """Record a successful read-class request without letting an audit
+        failure change the response. The insert runs in its own committed
+        transaction, after the read succeeded."""
+        if _CURRENT_AUDIT.get() is None:
+            return
+        try:
+            with self.store.transaction():
+                self._insert_audit(
+                    action_name=action,
+                    status=200,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    version=version,
+                    replayed=False,
+                    changes=[],
+                )
+        except Exception:
+            pass
 
     @_serialized
     def update(
@@ -184,10 +488,22 @@ class FhirVault:
         expected = parse_if_match(if_match)
         validated = parse_resource(resource_type, raw, expected_id=resource_id)
         self._assert_references(validated)
+
+        def audit(response: dict[str, Any], changes: list[dict[str, Any]], replayed: bool) -> AuditEventFields:
+            return AuditEventFields(
+                _ACTION_UPDATE,
+                200,
+                resource_type,
+                resource_id,
+                int(response["meta"]["versionId"]),
+                [],
+            )
+
         return self._idempotent(
             key,
             f"update:{resource_type}/{resource_id}",
             lambda: self._write(validated, reject_existing=False, if_match=expected),
+            audit=audit,
         )
 
     @_serialized
@@ -198,7 +514,12 @@ class FhirVault:
             row = self._require(resource_type, resource_id)
             return self._tombstone(resource_type, resource_id, row)
 
-        return self._idempotent(key, f"delete:{resource_type}/{resource_id}", apply)
+        def audit(response: dict[str, Any], changes: list[dict[str, Any]], replayed: bool) -> AuditEventFields:
+            return AuditEventFields(
+                _ACTION_DELETE, 200, resource_type, resource_id, response["version"], []
+            )
+
+        return self._idempotent(key, f"delete:{resource_type}/{resource_id}", apply, audit=audit)
 
     def _tombstone(self, resource_type: str, resource_id: str, row: Any) -> dict[str, Any]:
         version = row["current_version"] + 1
@@ -216,6 +537,7 @@ class FhirVault:
             (resource_type, resource_id, version, self.store.encode(document), moment),
         )
         self._record_events(resource_type, resource_id, "deleted", version, document, moment)
+        self._record_change("DELETE", resource_type, resource_id, version, True)
         return {"id": resource_id, "resourceType": resource_type, "deleted": True, "version": version, "lastUpdated": moment}
 
     # ------------------------------------------------------------------ transaction
@@ -242,8 +564,16 @@ class FhirVault:
                 "entry": [self._apply_transaction_entry(item, index) for index, item in enumerate(entries)],
             }
 
+        def audit(response: dict[str, Any], changes: list[dict[str, Any]], replayed: bool) -> AuditEventFields:
+            # A transaction has no single resource or version; the ordered
+            # per-entry changes describe it. A replay reports no changes (and
+            # created no versions, events, or delivery tasks).
+            return AuditEventFields(
+                _ACTION_TRANSACTION, 200, None, None, None, [] if replayed else list(changes)
+            )
+
         try:
-            return self._idempotent(key, f"transaction:{digest}", apply)
+            return self._idempotent(key, f"transaction:{digest}", apply, audit=audit)
         except ConflictError as error:
             raise OperationOutcomeError(409, "conflict", str(error)) from error
 
@@ -314,7 +644,14 @@ class FhirVault:
                     "meta": {"versionId": str(row["version"]), "lastUpdated": row["recorded_at"]},
                 }
             )
-        return {"resourceType": resource_type, "id": resource_id, "deleted": bool(head["deleted"]), "entries": entries}
+        result = {
+            "resourceType": resource_type,
+            "id": resource_id,
+            "deleted": bool(head["deleted"]),
+            "entries": entries,
+        }
+        self._safe_read_audit(_ACTION_HISTORY, resource_type, resource_id, None)
+        return result
 
     @_serialized
     def search(self, resource_type: str, parameters: dict[str, list[str]]) -> dict[str, Any]:
@@ -373,6 +710,7 @@ class FhirVault:
             included, revincluded = self._expand(resource_type, page_documents, includes, revincludes)
             result["include"] = included
             result["revinclude"] = revincluded
+        self._safe_read_audit(_ACTION_SEARCH, resource_type, None, None)
         return result
 
     @staticmethod
@@ -525,7 +863,14 @@ class FhirVault:
                 response["channel"] = channel
             return response
 
-        return self._idempotent(key, f"create-subscription:{subscription_id}", apply)
+        def audit(response: dict[str, Any], changes: list[dict[str, Any]], replayed: bool) -> AuditEventFields:
+            return AuditEventFields(
+                _ACTION_CREATE_SUBSCRIPTION, 201, "Subscription", subscription_id, None, []
+            )
+
+        return self._idempotent(
+            key, f"create-subscription:{subscription_id}", apply, audit=audit
+        )
 
     @_serialized
     def events(self, subscription_id: str) -> dict[str, Any]:
@@ -537,12 +882,14 @@ class FhirVault:
         rows = self.store.connection.execute(
             "SELECT payload FROM events WHERE subscription_id = ? ORDER BY sequence", (subscription_id,)
         ).fetchall()
-        return {
+        result = {
             "subscription_id": subscription_id,
             "criteria": self.store.decode(row["criteria"]),
             "total": len(rows),
             "events": [self.store.decode(stored["payload"]) for stored in rows],
         }
+        self._safe_read_audit("events", "Subscription", subscription_id, None)
+        return result
 
     @_serialized
     def deliveries(self, subscription_id: str) -> dict[str, Any]:
@@ -556,7 +903,7 @@ class FhirVault:
             "WHERE subscription_id = ? ORDER BY sequence",
             (subscription_id,),
         ).fetchall()
-        return {
+        result = {
             "subscription_id": subscription_id,
             "total": len(rows),
             "deliveries": [
@@ -569,6 +916,8 @@ class FhirVault:
                 for stored in rows
             ],
         }
+        self._safe_read_audit("deliveries", "Subscription", subscription_id, None)
+        return result
 
     def _record_events(
         self,

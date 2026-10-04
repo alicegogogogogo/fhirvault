@@ -77,6 +77,19 @@ class Store:
               next_attempt_at REAL,
               PRIMARY KEY (subscription_id, sequence)
             );
+            CREATE TABLE IF NOT EXISTS audit_events (
+              sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+              occurred_at TEXT NOT NULL,
+              actor TEXT NOT NULL,
+              action TEXT NOT NULL,
+              outcome TEXT NOT NULL,
+              status INTEGER NOT NULL,
+              resource_type TEXT,
+              resource_id TEXT,
+              version INTEGER,
+              replayed INTEGER NOT NULL DEFAULT 0,
+              changes TEXT NOT NULL
+            );
             """
         )
 

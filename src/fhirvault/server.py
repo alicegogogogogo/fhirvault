@@ -7,9 +7,14 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .errors import FhirVaultError, NotFoundError, OperationOutcomeError, ValidationError
-from .service import FhirVault
+from .service import FhirVault, audit_scope
 
 Response = tuple[int, Any, dict[str, str]]
+
+# How a recognized resource/Bundle/Subscription entry point is described on a
+# failure audit row. ``None`` means the request is not audited at all (/health,
+# GET /audit, the background worker's webhook calls, and unknown routes).
+AuditTarget = dict[str, str | None] | None
 
 
 def _etag(document: dict[str, Any]) -> str:
@@ -61,11 +66,71 @@ def make_handler(service: FhirVault) -> type[BaseHTTPRequestHandler]:
             parts = [unquote(part) for part in split.path.split("/") if part]
             return parts, parse_qs(split.query, keep_blank_values=True)
 
-        def _dispatch(self) -> Response:
-            parts, query = self._segments()
+        # -------------------------------------------------------------- audit
+
+        def _audit_target(self, parts: list[str]) -> AuditTarget:
+            """Describe the audited entry point a request addresses, or None
+            for paths that are not resource, Bundle, or Subscription entries
+            (/health, /audit, unknown routes/methods), which are not audited."""
+            command = self.command
+            if parts == ["audit"] and command == "GET":
+                return None
+            if parts and parts[0] == "fhir":
+                rest = parts[1:]
+                if not rest:
+                    if command == "POST":
+                        return {"action": "transaction", "resourceType": None, "resourceId": None}
+                    return None
+                resource_type = rest[0]
+                if resource_type == "Subscription":
+                    if command == "POST" and len(rest) == 1:
+                        return {"action": "create-subscription", "resourceType": "Subscription", "resourceId": None}
+                    return None
+                if len(rest) == 1:
+                    if command == "POST":
+                        action = "create"
+                    elif command == "GET":
+                        action = "search"
+                    else:
+                        return None
+                    return {"action": action, "resourceType": resource_type, "resourceId": None}
+                if len(rest) == 2:
+                    action = {"GET": "read", "PUT": "update", "DELETE": "delete"}.get(command)
+                    if action is None:
+                        return None
+                    return {"action": action, "resourceType": resource_type, "resourceId": rest[1]}
+                if len(rest) == 3 and rest[2] == "_history" and command == "GET":
+                    return {"action": "history", "resourceType": resource_type, "resourceId": rest[1]}
+                return None
+            if parts[:1] == ["Subscription"]:
+                if command == "POST" and len(parts) == 1:
+                    return {"action": "create-subscription", "resourceType": "Subscription", "resourceId": None}
+                return None
+            if parts[:1] == ["subscriptions"] and len(parts) == 3 and command == "GET":
+                if parts[2] in ("events", "deliveries"):
+                    return {"action": parts[2], "resourceType": "Subscription", "resourceId": parts[1]}
+            return None
+
+        def _record_failure(self, target: AuditTarget, status: int) -> None:
+            # The business transaction has already rolled back by the time the
+            # error reaches here; persist the failure as its own unit of work.
+            if target is None:
+                return
+            service.record_failure_audit(
+                action=str(target["action"]),
+                status=status,
+                resource_type=target["resourceType"],
+                resource_id=target["resourceId"],
+            )
+
+        # ----------------------------------------------------------- dispatch
+
+        def _dispatch(self, parts: list[str], query: dict[str, list[str]]) -> Response:
             key = self.headers.get("Idempotency-Key")
             if self.command == "GET" and parts == ["health"]:
                 return 200, {"status": "ok"}, {}
+            if self.command == "GET" and parts == ["audit"]:
+                return 200, service.audit_query(query), {}
             if parts and parts[0] == "fhir":
                 return self._resource_routes(parts[1:], query, key)
             if parts[:1] == ["Subscription"]:
@@ -119,21 +184,27 @@ def make_handler(service: FhirVault) -> type[BaseHTTPRequestHandler]:
             raise NotFoundError("route was not found")
 
         def _handle(self) -> None:
-            try:
-                status, response, headers = self._dispatch()
-                self._json(status, response, headers)
-            except OperationOutcomeError as error:
-                outcome = {
-                    "resourceType": "OperationOutcome",
-                    "issue": [
-                        {"severity": "error", "code": error.issue_code, "diagnostics": str(error)}
-                    ],
-                }
-                self._json(error.status, outcome, content_type="application/fhir+json")
-            except FhirVaultError as error:
-                self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
-            except Exception:
-                self._json(500, {"error": {"code": "internal_error", "message": "internal server error"}})
+            parts, query = self._segments()
+            target = self._audit_target(parts)
+            with audit_scope(self.headers.get("X-FhirVault-Actor")):
+                try:
+                    status, response, headers = self._dispatch(parts, query)
+                    self._json(status, response, headers)
+                except OperationOutcomeError as error:
+                    self._record_failure(target, error.status)
+                    outcome = {
+                        "resourceType": "OperationOutcome",
+                        "issue": [
+                            {"severity": "error", "code": error.issue_code, "diagnostics": str(error)}
+                        ],
+                    }
+                    self._json(error.status, outcome, content_type="application/fhir+json")
+                except FhirVaultError as error:
+                    self._record_failure(target, error.status)
+                    self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
+                except Exception:
+                    self._record_failure(target, 500)
+                    self._json(500, {"error": {"code": "internal_error", "message": "internal server error"}})
 
         do_GET = _handle
         do_POST = _handle
