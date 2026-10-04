@@ -77,6 +77,22 @@ class Store:
               next_attempt_at REAL,
               PRIMARY KEY (subscription_id, sequence)
             );
+            -- One row per audited HTTP request. AUTOINCREMENT keeps a
+            -- high-water mark outside the row itself, so a sequence is never
+            -- reused, even after a restart or a rolled-back transaction.
+            CREATE TABLE IF NOT EXISTS audit (
+              sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+              occurred_at TEXT NOT NULL,
+              actor TEXT NOT NULL,
+              action TEXT NOT NULL,
+              outcome TEXT NOT NULL,
+              status INTEGER NOT NULL,
+              resource_type TEXT,
+              resource_id TEXT,
+              version INTEGER,
+              replayed INTEGER NOT NULL,
+              changes TEXT NOT NULL
+            );
             """
         )
 

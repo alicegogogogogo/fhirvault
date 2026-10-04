@@ -18,7 +18,7 @@ _OPENER = build_opener(ProxyHandler({}))
 
 from fhirvault.errors import ConflictError, NotFoundError, OperationOutcomeError, ValidationError
 from fhirvault.server import make_handler
-from fhirvault.service import FhirVault
+from fhirvault.service import AuditContext, FhirVault
 
 
 class FrozenClock:
@@ -1438,6 +1438,324 @@ class WebhookDeliveryTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+
+class AuditHttpTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.database = str(Path(self.directory.name) / "vault.db")
+        self.service = FhirVault(self.database, FrozenClock())
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.service))
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        self.service.close()
+        self.directory.cleanup()
+
+    def request(self, method: str, path: str, payload: dict | None = None, headers: dict | None = None) -> tuple[int, dict, dict]:
+        return http_request(self.port, method, path, payload, headers)
+
+    def audit(self, query: str = "") -> dict:
+        status, _, body = self.request("GET", f"/audit{query}")
+        self.assertEqual(200, status)
+        return body
+
+    # ---------------------------------------------------------------- recording
+
+    def test_completed_requests_are_audited(self):
+        self.assertEqual(200, self.request("GET", "/health")[0])
+        self.assertEqual(0, self.audit()["total"])  # /health and /audit are not audited
+
+        self.assertEqual(201, self.request(
+            "POST", "/fhir/Patient", patient("p-1"), {"Idempotency-Key": "a1", "X-FhirVault-Actor": "dr-1"}
+        )[0])
+        self.assertEqual(200, self.request("GET", "/fhir/Patient/p-1")[0])
+        self.assertEqual(200, self.request("GET", "/fhir/Patient?gender=male", None, {"X-FhirVault-Actor": "   "})[0])
+        self.assertEqual(200, self.request(
+            "PUT", "/fhir/Patient/p-1", patient("p-1", gender="female"), {"Idempotency-Key": "a2"}
+        )[0])
+        self.assertEqual(200, self.request("GET", "/fhir/Patient/p-1/_history")[0])
+        self.assertEqual(200, self.request("DELETE", "/fhir/Patient/p-1", None, {"Idempotency-Key": "a3"})[0])
+
+        result = self.audit()
+        self.assertEqual(6, result["total"])
+        self.assertEqual(6, result["count"])
+        self.assertEqual(0, result["offset"])
+        self.assertEqual("sequence", result["sort"])
+        entries = result["entry"]
+        self.assertEqual([1, 2, 3, 4, 5, 6], [entry["sequence"] for entry in entries])
+        self.assertEqual(
+            ["create", "read", "search", "update", "history", "delete"],
+            [entry["action"] for entry in entries],
+        )
+        self.assertEqual(
+            ["dr-1", "anonymous", "anonymous", "anonymous", "anonymous", "anonymous"],
+            [entry["actor"] for entry in entries],
+        )
+        self.assertEqual(["success"] * 6, [entry["outcome"] for entry in entries])
+        self.assertEqual([201, 200, 200, 200, 200, 200], [entry["status"] for entry in entries])
+        self.assertEqual([1, 1, None, 2, None, 3], [entry["version"] for entry in entries])
+        self.assertEqual([False] * 6, [entry["replayed"] for entry in entries])
+        self.assertEqual([[]] * 6, [entry["changes"] for entry in entries])
+        self.assertEqual("Patient", entries[0]["resourceType"])
+        self.assertEqual("p-1", entries[0]["resourceId"])
+        self.assertIsNone(entries[2]["resourceId"])
+        for entry in entries:
+            self.assertTrue(entry["occurredAt"])
+
+    def test_failed_requests_are_audited_after_rollback(self):
+        self.assertEqual(400, self.request("POST", "/fhir/Patient", patient("p-1", telecom="x"), {"Idempotency-Key": "b1"})[0])
+        self.assertEqual(404, self.request("GET", "/fhir/Patient/p-404")[0])
+        self.assertEqual(400, self.request("POST", "/fhir/Patient", patient("p-2"))[0])  # missing Idempotency-Key
+        self.assertEqual(404, self.request("GET", "/nope")[0])  # not an audited entry point
+
+        entries = self.audit()["entry"]
+        self.assertEqual(3, len(entries))
+        self.assertEqual(["create", "read", "create"], [entry["action"] for entry in entries])
+        self.assertEqual(["failure"] * 3, [entry["outcome"] for entry in entries])
+        self.assertEqual([400, 404, 400], [entry["status"] for entry in entries])
+        self.assertEqual([None, None, None], [entry["version"] for entry in entries])
+        self.assertEqual("p-404", entries[1]["resourceId"])
+        # the failed writes left no resource behind
+        self.assertEqual(404, self.request("GET", "/fhir/Patient/p-1")[0])
+        self.assertEqual(404, self.request("GET", "/fhir/Patient/p-2")[0])
+
+    def test_transaction_produces_one_event_with_ordered_changes(self):
+        status, _, _ = self.request(
+            "POST", "/fhir",
+            transaction_bundle(
+                txn_entry("POST", "Patient", patient("p-1")),
+                txn_entry("PUT", "Patient/p-1", patient("p-1", gender="female")),
+                txn_entry("DELETE", "Patient/p-1"),
+            ),
+            {"Idempotency-Key": "txn-1", "X-FhirVault-Actor": "batch-bot"},
+        )
+        self.assertEqual(200, status)
+        entries = self.audit()["entry"]
+        self.assertEqual(1, len(entries))
+        (event,) = entries
+        self.assertEqual("transaction", event["action"])
+        self.assertEqual("success", event["outcome"])
+        self.assertEqual(200, event["status"])
+        self.assertEqual("batch-bot", event["actor"])
+        self.assertIsNone(event["resourceType"])
+        self.assertIsNone(event["resourceId"])
+        self.assertIsNone(event["version"])
+        self.assertFalse(event["replayed"])
+        self.assertEqual(
+            [
+                {"method": "POST", "resourceType": "Patient", "id": "p-1", "version": 1, "deleted": False},
+                {"method": "PUT", "resourceType": "Patient", "id": "p-1", "version": 2, "deleted": False},
+                {"method": "DELETE", "resourceType": "Patient", "id": "p-1", "version": 3, "deleted": True},
+            ],
+            event["changes"],
+        )
+
+    def test_failed_transaction_records_failure_with_empty_changes(self):
+        status, _, _ = self.request(
+            "POST", "/fhir",
+            transaction_bundle(
+                txn_entry("POST", "Patient", patient("p-1")),
+                txn_entry("POST", "Observation", observation("o-1", subject="Patient/p-404")),
+            ),
+            {"Idempotency-Key": "txn-bad"},
+        )
+        self.assertEqual(400, status)
+        entries = self.audit()["entry"]
+        self.assertEqual(1, len(entries))
+        event = entries[0]
+        self.assertEqual("transaction", event["action"])
+        self.assertEqual("failure", event["outcome"])
+        self.assertEqual(400, event["status"])
+        self.assertEqual([], event["changes"])
+        # rolled back: the first entry's write did not happen
+        self.assertEqual(404, self.request("GET", "/fhir/Patient/p-1")[0])
+
+    def test_idempotent_replay_adds_only_a_replayed_event(self):
+        self.request("POST", "/Subscription", {"id": "sub-1", "criteria": {"type": "Patient"}}, {"Idempotency-Key": "s1"})
+        first = self.request("POST", "/fhir/Patient", patient("p-1"), {"Idempotency-Key": "idem-1"})
+        replay = self.request("POST", "/fhir/Patient", patient("p-1"), {"Idempotency-Key": "idem-1"})
+        self.assertEqual(201, first[0])
+        self.assertEqual(first, replay)
+
+        entries = self.audit()["entry"]
+        self.assertEqual(3, len(entries))
+        self.assertEqual(["create-subscription", "create", "create"], [entry["action"] for entry in entries])
+        self.assertEqual([False, False, True], [entry["replayed"] for entry in entries])
+        replayed = entries[2]
+        self.assertEqual(1, replayed["version"])
+        self.assertEqual("p-1", replayed["resourceId"])
+        self.assertEqual([], replayed["changes"])
+        # the replay created no new version, subscription event, or delivery task
+        _, _, history = self.request("GET", "/fhir/Patient/p-1/_history")
+        self.assertEqual([1], [entry["version"] for entry in history["entries"]])
+        _, _, events = self.request("GET", "/subscriptions/sub-1/events")
+        self.assertEqual(1, events["total"])
+        _, _, deliveries = self.request("GET", "/subscriptions/sub-1/deliveries")
+        self.assertEqual(0, deliveries["total"])
+
+    def test_transaction_replay_records_replayed_event_without_changes(self):
+        bundle = transaction_bundle(txn_entry("POST", "Patient", patient("p-1")))
+        first = self.request("POST", "/fhir", bundle, {"Idempotency-Key": "txn-replay"})
+        replay = self.request("POST", "/fhir", bundle, {"Idempotency-Key": "txn-replay"})
+        self.assertEqual(first, replay)
+        entries = self.audit()["entry"]
+        self.assertEqual(2, len(entries))
+        self.assertEqual([False, True], [entry["replayed"] for entry in entries])
+        self.assertEqual(1, len(entries[0]["changes"]))
+        self.assertEqual([], entries[1]["changes"])
+        _, _, history = self.request("GET", "/fhir/Patient/p-1/_history")
+        self.assertEqual([1], [entry["version"] for entry in history["entries"]])
+
+    def test_subscription_endpoints_are_audited(self):
+        self.request("POST", "/Subscription", {"id": "sub-1", "criteria": {"type": "Patient"}}, {"Idempotency-Key": "s1"})
+        self.request("POST", "/fhir/Subscription", {"id": "sub-2", "criteria": {"type": "Patient"}}, {"Idempotency-Key": "s2"})
+        self.request("POST", "/fhir/Patient", patient("p-1"), {"Idempotency-Key": "p1"})
+        self.assertEqual(200, self.request("GET", "/subscriptions/sub-1/events")[0])
+        self.assertEqual(200, self.request("GET", "/subscriptions/sub-1/deliveries")[0])
+        entries = self.audit()["entry"]
+        self.assertEqual(
+            ["create-subscription", "create-subscription", "create", "events", "deliveries"],
+            [entry["action"] for entry in entries],
+        )
+        self.assertEqual("Subscription", entries[0]["resourceType"])
+        self.assertEqual("sub-1", entries[0]["resourceId"])
+        self.assertEqual("sub-2", entries[1]["resourceId"])
+        self.assertEqual("sub-1", entries[3]["resourceId"])
+        self.assertEqual("sub-1", entries[4]["resourceId"])
+
+    def test_audit_records_exclude_bodies_keys_and_secrets(self):
+        self.request(
+            "POST", "/Subscription",
+            {"id": "sub-1", "criteria": {"type": "Patient"},
+             "channel": {"endpoint": "http://127.0.0.1:9/hook", "secret": "s3cr3t"}},
+            {"Idempotency-Key": "secret-key-1"},
+        )
+        self.request("POST", "/fhir/Patient", patient("p-1"), {"Idempotency-Key": "secret-key-2"})
+        self.request("GET", "/fhir/Patient?name.family=Smith&_count=5")
+        serialized = json.dumps(self.audit())
+        self.assertNotIn("s3cr3t", serialized)
+        self.assertNotIn("secret-key-1", serialized)
+        self.assertNotIn("secret-key-2", serialized)
+        self.assertNotIn("Smith", serialized)
+        self.assertNotIn("name.family", serialized)
+
+    # ---------------------------------------------------------------- querying
+
+    def test_audit_filters_paging_and_sort(self):
+        self.request("POST", "/fhir/Patient", patient("p-1"), {"Idempotency-Key": "f1", "X-FhirVault-Actor": "alice"})
+        self.request("POST", "/fhir/Patient", patient("p-2"), {"Idempotency-Key": "f2", "X-FhirVault-Actor": "bob"})
+        self.request("GET", "/fhir/Patient/p-1", None, {"X-FhirVault-Actor": "alice"})
+        self.request("GET", "/fhir/Patient/p-404")
+
+        result = self.audit("?actor=alice")
+        self.assertEqual(2, result["total"])
+        self.assertEqual(["create", "read"], [entry["action"] for entry in result["entry"]])
+
+        result = self.audit("?outcome=failure")
+        self.assertEqual(1, result["total"])
+        self.assertEqual(404, result["entry"][0]["status"])
+
+        result = self.audit("?action=create&resourceType=Patient")
+        self.assertEqual(2, result["total"])
+
+        result = self.audit("?resourceId=p-2")
+        self.assertEqual(1, result["total"])
+        self.assertEqual("p-2", result["entry"][0]["resourceId"])
+
+        result = self.audit("?action=bogus")
+        self.assertEqual(0, result["total"])
+
+        result = self.audit("?_sort=-sequence&_count=2")
+        self.assertEqual("-sequence", result["sort"])
+        self.assertEqual(4, result["total"])
+        self.assertEqual(2, result["count"])
+        self.assertEqual([4, 3], [entry["sequence"] for entry in result["entry"]])
+
+        result = self.audit("?_count=1&_offset=2")
+        self.assertEqual(2, result["offset"])
+        self.assertEqual([3], [entry["sequence"] for entry in result["entry"]])
+
+    def test_audit_rejects_invalid_parameters_without_partial_results(self):
+        self.request("POST", "/fhir/Patient", patient("p-1"), {"Idempotency-Key": "g1"})
+        for query in (
+            "?bogus=1", "?_count=abc", "?_count=1001", "?_count=-1", "?_offset=-1",
+            "?_offset=x", "?_sort=bogus", "?_sort=_id", "?version=1",
+        ):
+            with self.subTest(query=query):
+                status, _, body = self.request("GET", f"/audit{query}")
+                self.assertEqual(400, status)
+                self.assertEqual("validation_error", body["error"]["code"])
+        # failed /audit queries are not themselves audited
+        self.assertEqual(1, self.audit()["total"])
+
+    # ---------------------------------------------------------------- restart
+
+    def test_audit_survives_restart_and_never_reuses_sequence(self):
+        self.request("POST", "/fhir/Patient", patient("p-1"), {"Idempotency-Key": "r1"})
+        self.assertEqual([1], [entry["sequence"] for entry in self.audit()["entry"]])
+
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        self.service.close()
+        self.service = FhirVault(self.database, FrozenClock())
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.service))
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+        self.assertEqual([1], [entry["sequence"] for entry in self.audit()["entry"]])
+        self.request("POST", "/fhir/Patient", patient("p-2"), {"Idempotency-Key": "r2"})
+        entries = self.audit()["entry"]
+        self.assertEqual([1, 2], [entry["sequence"] for entry in entries])
+        self.assertEqual("p-2", entries[1]["resourceId"])
+
+
+class AuditServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = FhirVault(str(Path(self.directory.name) / "vault.db"), FrozenClock())
+
+    def tearDown(self):
+        self.service.close()
+        self.directory.cleanup()
+
+    def test_successful_write_and_audit_commit_atomically(self):
+        context = AuditContext("dr-1", "create", 201, "Patient")
+        self.service.create("Patient", patient("p-1"), "k1", audit=context)
+        self.assertTrue(context.recorded)
+        entries = self.service.audit_events({})["entry"]
+        self.assertEqual(1, len(entries))
+        self.assertEqual(1, entries[0]["version"])
+        self.assertEqual("p-1", entries[0]["resourceId"])
+        self.assertEqual("1", self.service.read("Patient", "p-1")["meta"]["versionId"])
+
+    def test_failed_write_records_nothing_until_the_failure_is_reported(self):
+        context = AuditContext("dr-1", "create", 201, "Patient")
+        with self.assertRaises(ValidationError):
+            self.service.create("Patient", patient("p-1", telecom="x"), "k2", audit=context)
+        self.assertFalse(context.recorded)
+        self.assertEqual(0, self.service.audit_events({})["total"])
+        self.service.record_audit_failure(context, 400)
+        entries = self.service.audit_events({})["entry"]
+        self.assertEqual(1, len(entries))
+        self.assertEqual("failure", entries[0]["outcome"])
+        self.assertEqual(400, entries[0]["status"])
+        # reporting the same request twice is not possible
+        self.service.record_audit_failure(context, 500)
+        self.assertEqual(1, self.service.audit_events({})["total"])
+
+    def test_calls_without_an_audit_context_record_nothing(self):
+        self.service.create("Patient", patient("p-1"), "k3")
+        self.service.read("Patient", "p-1")
+        self.service.search("Patient", {})
+        self.assertEqual(0, self.service.audit_events({})["total"])
 
 
 if __name__ == "__main__":
